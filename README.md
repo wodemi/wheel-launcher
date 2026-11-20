@@ -2,7 +2,15 @@
 
 按住鼠标侧键（或 Tab+A / Tab+B）呼出一个大圆盘，桌面上的应用按**首字母**排成若干圆环，移动鼠标选中、松手即启动。不用桌面图标，也不用开始菜单。
 
-![轮盘](docs/final-am.png)
+![轮盘启动器](docs/hero.png)
+
+## 截图
+
+| 侧键 1 · A–M | 侧键 2 · N–Z |
+| --- | --- |
+| ![A-M](docs/wheel-am.png) | ![N-Z](docs/wheel-nz.png) |
+
+![两盘对照](docs/wheels.png)
 
 ## 功能
 
