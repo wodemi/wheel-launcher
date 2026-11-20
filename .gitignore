@@ -1,0 +1,6 @@
+WheelLauncher.exe
+*.pdb
+*.log
+.vs/
+obj/
+bin/
