@@ -819,6 +819,8 @@ namespace WheelLauncher
 
     public class WheelWindow : Window
     {
+        public static bool ShotMode;
+
         public static readonly double IconGap = 4;
         public static double RingOffset(int i) { return i * 137.508 * Math.PI / 180.0; }
 
@@ -942,7 +944,7 @@ namespace WheelLauncher
                 Width = cr * 3.0
             };
             Canvas.SetLeft(subText, cx - cr * 1.5);
-            Canvas.SetTop(subText, cy + cr * 0.72);
+            Canvas.SetTop(subText, cy + cr * 0.66);
             root.Children.Add(subText);
 
             foreach (var ring in rings)
@@ -1053,14 +1055,17 @@ namespace WheelLauncher
             };
             root.Children.Add(bottomBar);
 
-            var tip = new TextBlock
+            if (!ShotMode)
             {
-                Text = "Esc 取消 · 空白处松手不启动 · Tab+A / Tab+B 呼出",
-                Foreground = new SolidColorBrush(Color.FromArgb(140, 220, 215, 240)),
-                FontSize = 11
-            };
-            Canvas.SetLeft(tip, 10); Canvas.SetTop(tip, winSize - 22);
-            root.Children.Add(tip);
+                var tip = new TextBlock
+                {
+                    Text = "Esc 取消 · 空白处松手不启动 · Tab+A / Tab+B 呼出",
+                    Foreground = new SolidColorBrush(Color.FromArgb(140, 220, 215, 240)),
+                    FontSize = 11
+                };
+                Canvas.SetLeft(tip, 10); Canvas.SetTop(tip, winSize - 22);
+                root.Children.Add(tip);
+            }
         }
 
         public void PlaceAt(int screenX, int screenY, double scale)
@@ -1129,7 +1134,7 @@ namespace WheelLauncher
                     highlight.Visibility = Visibility.Collapsed;
                     bottomBar.Visibility = Visibility.Collapsed;
                     centerText.Text = "+";
-                    centerText.FontSize = Math.Max(20, hubRadius * 0.9);
+                    centerText.FontSize = Math.Max(16, hubRadius * 0.60);
                     centerText.Foreground = new SolidColorBrush(Color.FromArgb(238, 226, 216, 255));
                     Canvas.SetTop(centerText, cy - centerText.FontSize * 0.62);
                 }
@@ -1394,6 +1399,7 @@ class WheelApp : Application
             if (e.Args.Contains("--ticktest")) { Log.W("ticktest"); Click.Test(); }
             if (e.Args.Contains("--probe2")) { Dispatcher.BeginInvoke(new Action(() => { ShowWheel(0, 1280, 700, 1280, 700); DispatcherTimerOneShot(700, delegate { if (wheel != null) wheel.Probe((int)Math.Round(scale)); }); })); }
             if (e.Args.Contains("--addtest")) { Dispatcher.BeginInvoke(new Action(() => OpenAddDialog())); }
+            if (e.Args.Contains("--shot")) WheelWindow.ShotMode = true;
             if (e.Args.Contains("--show1")) { Dispatcher.BeginInvoke(new Action(() => { var w = WF.Screen.PrimaryScreen.WorkingArea; ShowWheel(1, w.Width / 2, w.Height / 2, w.Width / 2 - 200, w.Height / 2); }), DispatcherPriority.Background); }
             if (e.Args.Contains("--show2")) { Dispatcher.BeginInvoke(new Action(() => { var w = WF.Screen.PrimaryScreen.WorkingArea; ShowWheel(2, w.Width / 2, w.Height / 2, w.Width / 2 - 200, w.Height / 2); }), DispatcherPriority.Background); }
             if (e.Args.Contains("--show")) { Dispatcher.BeginInvoke(new Action(() => { var scr = WF.Screen.PrimaryScreen.WorkingArea; ShowWheel(0, scr.Width / 2, scr.Height / 2, scr.Width / 2, scr.Height / 2); }), DispatcherPriority.Background); }
