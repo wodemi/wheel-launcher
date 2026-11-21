@@ -251,6 +251,87 @@ namespace WheelLauncher
         }
     }
 
+    public static class GameWatch
+    {
+        public static volatile bool Suspended;
+        public static string Reason = "";
+        public static Action<bool> Changed;
+        static System.Threading.Thread th;
+
+        public static void Start()
+        {
+            if (th != null) return;
+            th = new System.Threading.Thread(Loop);
+            th.IsBackground = true;
+            th.Start();
+        }
+
+        static void Loop()
+        {
+            while (true)
+            {
+                try { Scan(); } catch (Exception ex) { Log.W("gamewatch error: " + ex.Message); }
+                System.Threading.Thread.Sleep(1200);
+            }
+        }
+
+        static readonly string[] NotGame = { "explorer", "chrome", "msedge", "firefox", "opera", "brave", "vivaldi",
+            "code", "devenv", "discord", "telegram", "wechat", "weixin", "qq", "notepad", "powershell", "pwsh",
+            "cmd", "windowsterminal", "wt", "applicationframehost", "searchhost", "startmenuexperiencehost",
+            "shellexperiencehost", "dwm", "taskmgr", "systemsettings", "photos", "mspaint", "word", "excel",
+            "powerpnt", "wps", "acrobat", "zotero", "spotify", "vlc", "bilibili", "potplayermini64" };
+
+        static readonly string[] GameDirs = { "\\steamapps\\common\\", "\\epic games\\", "\\gog games\\", "\\wegameapps\\",
+            "\\riot games\\", "\\battle.net\\", "\\ea games\\", "\\origin games\\", "\\xboxgames\\", "\\game\\", "\\games\\" };
+
+        static void Scan()
+        {
+            bool now = false; string why = "";
+            if (Settings.AutoPause)
+            {
+                IntPtr h = Native.GetForegroundWindow();
+                if (h != IntPtr.Zero) now = IsGame(h, out why);
+            }
+            if (now != Suspended)
+            {
+                Suspended = now;
+                Reason = why;
+                Log.W("gamewatch: " + (now ? "suspend (" + why + ")" : "resume"));
+                var c = Changed;
+                if (c != null) { try { c(now); } catch { } }
+            }
+        }
+
+        static bool IsGame(IntPtr h, out string why)
+        {
+            why = "";
+            uint pid;
+            Native.GetWindowThreadProcessId(h, out pid);
+            if (pid == 0) return false;
+            string exe = "", path = "";
+            try
+            {
+                var p = Process.GetProcessById((int)pid);
+                exe = (p.ProcessName ?? "").ToLowerInvariant();
+                try { path = (p.MainModule.FileName ?? "").ToLowerInvariant(); } catch { }
+            }
+            catch { return false; }
+            for (int i = 0; i < NotGame.Length; i++) if (exe == NotGame[i]) return false;
+            if (path.Length > 0)
+                for (int i = 0; i < GameDirs.Length; i++)
+                    if (path.Contains(GameDirs[i])) { why = "path:" + exe; return true; }
+            Native.RECT r;
+            if (!Native.GetWindowRect(h, out r)) return false;
+            var scr = WF.Screen.FromHandle(h).Bounds;
+            bool covers = r.Left <= scr.Left && r.Top <= scr.Top && r.Right >= scr.Right && r.Bottom >= scr.Bottom;
+            long style = Native.GetWindowLongPtr(h, -16).ToInt64() & 0xFFFFFFFFL;
+            bool caption = (style & 0x00C00000L) != 0;
+            bool popup = (style & 0x80000000L) != 0;
+            if (covers && !caption && popup) { why = "fullscreen:" + exe; return true; }
+            return false;
+        }
+    }
+
     public static class Launcher
     {
         public static void Run(AppEntry e)
@@ -283,6 +364,21 @@ namespace WheelLauncher
 
         [DllImport("user32.dll")]
         public static extern short GetAsyncKeyState(int vKey);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+
+        [DllImport("user32.dll")]
+        public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
+
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongPtr")]
+        public static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct RECT { public int Left, Top, Right, Bottom; }
 
         public static void KeyTap(byte vk)
         {
@@ -656,6 +752,12 @@ namespace WheelLauncher
             set { Set("longpress", Math.Max(250, Math.Min(2000, value)).ToString()); }
         }
 
+        public static bool AutoPause
+        {
+            get { return GetInt("autopause", 1) != 0; }
+            set { Set("autopause", value ? "1" : "0"); }
+        }
+
         public static bool TabHotkey
         {
             get { return GetInt("tabhotkey", 1) != 0; }
@@ -733,6 +835,7 @@ namespace WheelLauncher
         {
             try
             {
+                if (GameWatch.Suspended) return Native.CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
                 if (nCode >= 0)
                 {
                     var info = (Native.MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.MSLLHOOKSTRUCT));
@@ -765,6 +868,11 @@ namespace WheelLauncher
         {
             try
             {
+                if (GameWatch.Suspended)
+                {
+                    TabDown = false; ChordFired = false; ChordUsed = false;
+                    return Native.CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+                }
                 int msg = wParam.ToInt32();
                 if (nCode >= 0 && (msg == 0x0100 || msg == 0x0104))
                 {
@@ -1407,6 +1515,17 @@ class WheelApp : Application
             hook.Install(Settings.TabHotkey);
             if (!hook.Ok) Log.W("HOOK INSTALL FAILED - hotkeys will not work");
 
+            GameWatch.Changed = delegate (bool on)
+            {
+                try
+                {
+                    if (on) CloseWheel();
+                    if (tray != null) tray.Text = on ? "轮盘启动器（游戏中已暂停）" : "轮盘启动器";
+                }
+                catch { }
+            };
+            GameWatch.Start();
+
             tray = new WF.NotifyIcon();
             tray.Icon = LoadExeIcon() ?? MakeIcon();
             tray.Text = "轮盘启动器";
@@ -1418,6 +1537,9 @@ class WheelApp : Application
             menu.Items.Add("重新扫描应用", null, (s, a) => RescanAsync());
             menu.Items.Add("添加应用…", null, (s, a) => OpenAddDialog());
             menu.Items.Add("设置…", null, (s, a) => OpenSettings());
+            var gap = new WF.ToolStripMenuItem("游戏自动暂停（全屏/游戏目录时）") { CheckOnClick = true, Checked = Settings.AutoPause };
+            gap.CheckedChanged += (s, a) => { Settings.AutoPause = gap.Checked; Log.W("autopause=" + gap.Checked); };
+            menu.Items.Add(gap);
             var snd = new WF.ToolStripMenuItem("选中音效") { CheckOnClick = true, Checked = Settings.SoundOn };
             snd.CheckedChanged += (s, a) => { Settings.SoundOn = snd.Checked; Log.W("sound=" + snd.Checked); };
             menu.Items.Add(snd);
