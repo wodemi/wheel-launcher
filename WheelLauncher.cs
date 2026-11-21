@@ -175,7 +175,7 @@ namespace WheelLauncher
                     var line = raw.Trim();
                     if (line.Length == 0 || line.StartsWith("#")) continue;
                     var p = line.Split('|');
-                    if (p.Length < 2 || !File.Exists(p[1])) continue;
+                    if (p.Length < 2 || (!File.Exists(p[1]) && !Directory.Exists(p[1]))) continue;
                     list.Add(new AppEntry { Name = p[0], Path = p[1], Args = p.Length > 2 ? p[2] : "", Initial = Pinyin.Get(p[0]) });
                 }
             }
@@ -187,6 +187,27 @@ namespace WheelLauncher
         {
             Directory.CreateDirectory(Paths.Root);
             File.AppendAllText(CustomFile, name.Replace("|", " ") + "|" + path + "|" + (args ?? "").Replace("|", " ") + "\r\n", Encoding.UTF8);
+        }
+
+        public static bool RemoveCustom(string path)
+        {
+            try
+            {
+                if (!File.Exists(CustomFile)) return false;
+                var keep = new List<string>();
+                bool removed = false;
+                foreach (var raw in File.ReadAllLines(CustomFile, Encoding.UTF8))
+                {
+                    var line = raw.Trim();
+                    if (line.Length == 0) continue;
+                    var p = line.Split('|');
+                    if (p.Length >= 2 && string.Equals(p[1], path, StringComparison.OrdinalIgnoreCase)) { removed = true; continue; }
+                    keep.Add(line);
+                }
+                if (removed) File.WriteAllLines(CustomFile, keep.ToArray(), Encoding.UTF8);
+                return removed;
+            }
+            catch { return false; }
         }
 
         public static List<AppEntry> FromDesktop()
@@ -302,6 +323,14 @@ namespace WheelLauncher
             }
         }
 
+        public static bool IsGamePath(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return false;
+            string lp = path.ToLowerInvariant();
+            for (int i = 0; i < GameDirs.Length; i++) if (lp.Contains(GameDirs[i])) return true;
+            return false;
+        }
+
         static bool IsGame(IntPtr h, out string why)
         {
             why = "";
@@ -339,6 +368,11 @@ namespace WheelLauncher
             try
             {
                 Log.W("launch name=" + e.Name + " path=" + e.Path + " args=" + e.Args);
+                if (Directory.Exists(e.Path))
+                {
+                    Process.Start(new ProcessStartInfo("explorer.exe", "\"" + e.Path + "\"") { UseShellExecute = true });
+                    return;
+                }
                 var psi = new ProcessStartInfo(e.Path);
                 if (!string.IsNullOrEmpty(e.Args)) psi.Arguments = e.Args;
                 psi.WorkingDirectory = System.IO.Path.GetDirectoryName(e.Path);
@@ -1066,9 +1100,9 @@ namespace WheelLauncher
 
             centerText = new TextBlock
             {
-                Text = "+",
+                Text = "⚙",
                 Foreground = new SolidColorBrush(Color.FromArgb(238, 226, 216, 255)),
-                FontSize = Math.Max(20, cr * 0.9),
+                FontSize = Math.Max(18, cr * 0.66),
                 FontWeight = FontWeights.Light,
                 TextAlignment = TextAlignment.Center,
                 Width = cr * 2,
@@ -1276,8 +1310,8 @@ namespace WheelLauncher
                 {
                     highlight.Visibility = Visibility.Collapsed;
                     bottomBar.Visibility = Visibility.Collapsed;
-                    centerText.Text = "+";
-                    centerText.FontSize = Math.Max(16, hubRadius * 0.60);
+                    centerText.Text = "⚙";
+                    centerText.FontSize = Math.Max(16, hubRadius * 0.55);
                     centerText.Foreground = new SolidColorBrush(Color.FromArgb(238, 226, 216, 255));
                     Canvas.SetTop(centerText, cy - centerText.FontSize * 0.62);
                 }
@@ -1331,6 +1365,134 @@ namespace WheelLauncher
             try { var a = Commit(); if (Pick != null) Pick(a); } catch { }
         }
     }
+    public class WheelSettingsWindow : Window
+    {
+        public class Row
+        {
+            public string Name { get; set; }
+            public string Kind { get; set; }
+            public string Game { get; set; }
+            public string Path { get; set; }
+            public bool Custom { get; set; }
+        }
+
+        ListView lv;
+        TextBlock tip;
+        public bool Changed;
+
+        public WheelSettingsWindow()
+        {
+            Title = "圆盘设置 · 应用 / 文件 / 文件夹";
+            Width = 900; Height = 620;
+            WindowStartupLocation = WindowStartupLocation.CenterScreen;
+            var root = new DockPanel { Background = new SolidColorBrush(Color.FromRgb(26, 24, 36)) };
+            Content = root;
+
+            var bar = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(14, 12, 14, 8) };
+            var bFile = new Button { Content = "添加文件…", Padding = new Thickness(12, 6, 12, 6), Margin = new Thickness(0, 0, 8, 0) };
+            var bDir = new Button { Content = "添加文件夹…", Padding = new Thickness(12, 6, 12, 6), Margin = new Thickness(0, 0, 8, 0) };
+            var bDel = new Button { Content = "移除自定义项", Padding = new Thickness(12, 6, 12, 6), Margin = new Thickness(0, 0, 8, 0) };
+            var bRel = new Button { Content = "重新扫描", Padding = new Thickness(12, 6, 12, 6) };
+            bar.Children.Add(bFile);
+            bar.Children.Add(bDir);
+            bar.Children.Add(bDel);
+            bar.Children.Add(bRel);
+            DockPanel.SetDock(bar, Dock.Top);
+            root.Children.Add(bar);
+
+            var foot = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(14, 8, 14, 12) };
+            tip = new TextBlock { Text = "", Foreground = new SolidColorBrush(Color.FromRgb(158, 156, 178)), VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 16, 0) };
+            var bClose = new Button { Content = "关闭", Padding = new Thickness(20, 6, 20, 6) };
+            foot.Children.Add(tip);
+            foot.Children.Add(bClose);
+            DockPanel.SetDock(foot, Dock.Bottom);
+            root.Children.Add(foot);
+
+            lv = new ListView { Margin = new Thickness(14, 0, 14, 0) };
+            var gv = new GridView();
+            gv.Columns.Add(new GridViewColumn { Header = "名称", Width = 240, DisplayMemberBinding = new System.Windows.Data.Binding("Name") });
+            gv.Columns.Add(new GridViewColumn { Header = "类型", Width = 70, DisplayMemberBinding = new System.Windows.Data.Binding("Kind") });
+            gv.Columns.Add(new GridViewColumn { Header = "游戏", Width = 56, DisplayMemberBinding = new System.Windows.Data.Binding("Game") });
+            gv.Columns.Add(new GridViewColumn { Header = "路径", Width = 470, DisplayMemberBinding = new System.Windows.Data.Binding("Path") });
+            lv.View = gv;
+            root.Children.Add(lv);
+
+            bClose.Click += delegate { Close(); };
+            bRel.Click += delegate { Reload(); };
+            bFile.Click += delegate { Pick(false); };
+            bDir.Click += delegate { Pick(true); };
+            bDel.Click += delegate { RemoveSelected(); };
+            Loaded += delegate { Reload(); };
+        }
+
+        public void Reload()
+        {
+            try
+            {
+                lv.Items.Clear();
+                var custom = Scanner.LoadCustom();
+                foreach (var a in Scanner.FromDesktop())
+                {
+                    bool isDir = Directory.Exists(a.Path);
+                    bool isCustom = custom.Exists(delegate (AppEntry c) { return string.Equals(c.Path, a.Path, StringComparison.OrdinalIgnoreCase); });
+                    lv.Items.Add(new Row
+                    {
+                        Name = a.Name,
+                        Path = a.Path,
+                        Kind = isDir ? "文件夹" : (a.Path.ToLowerInvariant().EndsWith(".exe") ? "应用" : "文件"),
+                        Game = GameWatch.IsGamePath(a.Path) ? "是" : "",
+                        Custom = isCustom
+                    });
+                }
+                tip.Text = "共 " + lv.Items.Count + " 项" + (GameWatch.Suspended ? " · 已在游戏中，轮盘暂停" : "");
+            }
+            catch (Exception ex) { tip.Text = "读取失败：" + ex.Message; }
+        }
+
+        void Pick(bool folder)
+        {
+            try
+            {
+                string path = null;
+                if (folder)
+                {
+                    var d = new WF.FolderBrowserDialog();
+                    d.Description = "选择要加到圆盘的文件夹";
+                    if (d.ShowDialog() == WF.DialogResult.OK) path = d.SelectedPath;
+                }
+                else
+                {
+                    var d = new WF.OpenFileDialog();
+                    d.Title = "选择要加到圆盘的文件";
+                    d.Filter = "程序 (*.exe)|*.exe|所有文件 (*.*)|*.*";
+                    if (d.ShowDialog() == WF.DialogResult.OK) path = d.FileName;
+                }
+                if (string.IsNullOrEmpty(path)) return;
+                string name = System.IO.Path.GetFileName(path);
+                if (name.ToLowerInvariant().EndsWith(".exe")) name = name.Substring(0, name.Length - 4);
+                if (name.Length == 0) name = path;
+                Scanner.AddCustom(name, path, "");
+                Changed = true;
+                Log.W("settings add: " + name + " -> " + path);
+                Reload();
+            }
+            catch (Exception ex) { tip.Text = "添加失败：" + ex.Message; }
+        }
+
+        void RemoveSelected()
+        {
+            var r = lv.SelectedItem as Row;
+            if (r == null) { tip.Text = "先在列表里选中一项"; return; }
+            if (Scanner.RemoveCustom(r.Path))
+            {
+                Changed = true;
+                Log.W("settings remove: " + r.Path);
+                Reload();
+            }
+            else tip.Text = "这一项来自桌面快捷方式，程序里删不掉（要到桌面删）；这里只能移除用「添加」加进来的项。";
+        }
+    }
+
     public class AddAppDialog : Window
     {
         public string ResultName, ResultPath, ResultArgs;
@@ -1536,6 +1698,7 @@ class WheelApp : Application
             menu.Items.Add("显示轮盘 (测试)", null, (s, a) => ShowAtCursor());
             menu.Items.Add("重新扫描应用", null, (s, a) => RescanAsync());
             menu.Items.Add("添加应用…", null, (s, a) => OpenAddDialog());
+            menu.Items.Add("圆盘设置（应用 / 文件 / 文件夹）…", null, (s, a) => OpenWheelSettings());
             menu.Items.Add("设置…", null, (s, a) => OpenSettings());
             var gap = new WF.ToolStripMenuItem("游戏自动暂停（全屏/游戏目录时）") { CheckOnClick = true, Checked = Settings.AutoPause };
             gap.CheckedChanged += (s, a) => { Settings.AutoPause = gap.Checked; Log.W("autopause=" + gap.Checked); };
@@ -1563,6 +1726,7 @@ class WheelApp : Application
             if (e.Args.Contains("--ticktest")) { Log.W("ticktest"); Click.Test(); }
             if (e.Args.Contains("--probe2")) { Dispatcher.BeginInvoke(new Action(() => { ShowWheel(0, 1280, 700, 1280, 700); DispatcherTimerOneShot(700, delegate { if (wheel != null) wheel.Probe((int)Math.Round(scale)); }); })); }
             if (e.Args.Contains("--addtest")) { Dispatcher.BeginInvoke(new Action(() => OpenAddDialog())); }
+            if (e.Args.Contains("--wheelsettings")) { Dispatcher.BeginInvoke(new Action(() => OpenWheelSettings())); }
             if (e.Args.Contains("--shot")) WheelWindow.ShotMode = true;
             if (e.Args.Contains("--show1")) { Dispatcher.BeginInvoke(new Action(() => { var w = WF.Screen.PrimaryScreen.WorkingArea; ShowWheel(1, w.Width / 2, w.Height / 2, w.Width / 2 - 200, w.Height / 2); }), DispatcherPriority.Background); }
             if (e.Args.Contains("--show2")) { Dispatcher.BeginInvoke(new Action(() => { var w = WF.Screen.PrimaryScreen.WorkingArea; ShowWheel(2, w.Width / 2, w.Height / 2, w.Width / 2 - 200, w.Height / 2); }), DispatcherPriority.Background); }
@@ -1779,7 +1943,7 @@ class WheelApp : Application
                 if (mv >= 24 * scale && wheel.HitHub(x, y, scale))
                 {
                     CloseWheel();
-                    OpenAddDialog();
+                    OpenWheelSettings();
                     return;
                 }
                 var hitSel = wheel.Commit();
@@ -1811,6 +1975,18 @@ class WheelApp : Application
                 }
             }
             catch (Exception ex) { Log.W("OpenAddDialog failed: " + ex.Message); }
+        }
+
+        void OpenWheelSettings()
+        {
+            try
+            {
+                var w = new WheelSettingsWindow();
+                w.ShowDialog();
+                if (w.Changed) apps = Scanner.FromDesktop();
+                Log.W("wheel settings closed changed=" + w.Changed + " apps=" + apps.Count);
+            }
+            catch (Exception ex) { Log.W("OpenWheelSettings failed: " + ex.Message); }
         }
 
         void OnEscape()
@@ -1888,7 +2064,7 @@ class WheelApp : Application
                 CloseWheel();
                 System.Threading.ThreadPool.QueueUserWorkItem(delegate { Click.Warm(); });
                 wheel = new WheelWindow();
-                wheel.Pick = delegate (AppEntry a) { CloseWheel(); if (a != null) Launcher.Run(a); else OpenAddDialog(); };
+                wheel.Pick = delegate (AppEntry a) { CloseWheel(); if (a != null) Launcher.Run(a); else OpenWheelSettings(); };
                 wheel.SetLayout(layout, icon, hub, 0, btn == 1 ? "侧键1 · A-M" : (btn == 2 ? "侧键2 · N-Z" : "全部应用"));
                 wheel.PlaceAt(sx, sy, scale);
                 wheel.Show();
