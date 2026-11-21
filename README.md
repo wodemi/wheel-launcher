@@ -4,6 +4,11 @@
 
 ![轮盘启动器](docs/hero.png)
 
+## 下载
+
+- **[WheelLauncher-v0.1.2-win-x64.zip](https://github.com/wodemi/wheel-launcher/releases/latest/download/WheelLauncher-v0.1.2-win-x64.zip)** — 约 104 KB，解压后双击 `WheelLauncher.exe` 就能用（.NET Framework 4.8 系统自带，无需安装任何运行库）。
+- 历史版本与更新说明：[Releases](https://github.com/wodemi/wheel-launcher/releases)
+
 ## 截图
 
 | 侧键 1 · A–M | 侧键 2 · N–Z |
@@ -51,6 +56,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 - exe **未做代码签名**：首次运行 Windows SmartScreen 会提示「未知发布者」，点「更多信息 → 仍要运行」即可。
 - 程序会安装**全局键鼠钩子**（这是读取侧键和 Tab 组合键的唯一办法），个别杀毒软件可能报「可疑行为」，需要手动放行。
 - 侧键必须是 Windows 标准的 XBUTTON1 / XBUTTON2。如果用罗技 Options+、雷蛇雷云等驱动把侧键改成了别的功能，程序就收不到。
+- 多显示器且各屏缩放比例不同时，轮盘的尺寸和位置按主屏 DPI 计算，副屏上可能偏大偏小。
 - 纯本地程序，不联网、不上传任何数据。
 
 ## 许可证
