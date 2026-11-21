@@ -208,7 +208,6 @@ namespace WheelLauncher
                 {
                     string name = System.IO.Path.GetFileNameWithoutExtension(lnk);
             if (name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) name = name.Substring(0, name.Length - 4);
-                    if (seen.Contains(name)) continue;
                     string target = "", args = "";
                     try
                     {
@@ -223,7 +222,17 @@ namespace WheelLauncher
                     catch { }
                     if (string.IsNullOrEmpty(target) || !File.Exists(target)) continue;
                     if (string.Equals(target, SelfExe, StringComparison.OrdinalIgnoreCase)) continue;
-                    seen.Add(name);
+                    // 按目标路径去重（原来按显示名去重，同名不同程序会被吞掉）
+                    string key = target.ToLowerInvariant();
+                    if (seen.Contains(key)) continue;
+                    seen.Add(key);
+                    if (list.Exists(delegate (AppEntry q) { return string.Equals(q.Name, name, StringComparison.OrdinalIgnoreCase); }))
+                    {
+                        int n2 = 2;
+                        string cand = name;
+                        while (list.Exists(delegate (AppEntry q) { return string.Equals(q.Name, cand, StringComparison.OrdinalIgnoreCase); })) cand = name + " " + (n2++);
+                        name = cand;
+                    }
                     list.Add(new AppEntry { Name = name, Path = target, Args = args, Initial = Pinyin.Get(name) });
                 }
             }
@@ -271,6 +280,9 @@ namespace WheelLauncher
 
         [DllImport("user32.dll")]
         public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+        [DllImport("user32.dll")]
+        public static extern short GetAsyncKeyState(int vKey);
 
         public static void KeyTap(byte vk)
         {
@@ -662,8 +674,10 @@ namespace WheelLauncher
         public static bool AcceptInjected = false;
         public static bool TabDown = false;
         public static bool ChordFired = false;
+        public static bool ChordUsed = false;
         public static Action<int> Quick;
         public static Action CommitKey;
+        public static Action ChordRelease;
         public static Func<bool> WheelOpen;
         int _mvCount = 0;
 
@@ -762,6 +776,17 @@ namespace WheelLauncher
                         bool open = WheelOpen != null && WheelOpen();
                         if (vk == 0x09)
                         {
+                            // Alt/Ctrl/Shift/Win + Tab 一律放行，否则 Alt+Tab 切窗口会被打断
+                            bool mods = (Native.GetAsyncKeyState(0x12) & 0x8000) != 0
+                                     || (Native.GetAsyncKeyState(0x11) & 0x8000) != 0
+                                     || (Native.GetAsyncKeyState(0x10) & 0x8000) != 0
+                                     || (Native.GetAsyncKeyState(0x5B) & 0x8000) != 0
+                                     || (Native.GetAsyncKeyState(0x5C) & 0x8000) != 0;
+                            if (mods)
+                            {
+                                TabDown = false; ChordFired = false;
+                                return Native.CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+                            }
                             if (TabDown)
                             {
                                 if (!AcceptInjected) Native.KeyTap(0x09);
@@ -769,6 +794,7 @@ namespace WheelLauncher
                             }
                             TabDown = true;
                             ChordFired = false;
+                            ChordUsed = false;
                             return (IntPtr)1;
                         }
                         else if (vk == Native.VK_ESCAPE)
@@ -780,6 +806,7 @@ namespace WheelLauncher
                         {
                             int which = vk == 0x41 ? 1 : 2;
                             ChordFired = true;
+                            ChordUsed = true;
                             Log.W("hotkey tab+" + (which == 1 ? "A" : "B"));
                             System.Windows.Application.Current.Dispatcher.BeginInvoke(new Action(() => { var q = Quick; if (q != null) q(which); }));
                             return (IntPtr)1;
@@ -794,10 +821,18 @@ namespace WheelLauncher
                 else if (nCode >= 0 && msg == 0x0101)
                 {
                     var k2 = (Native.KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.KBDLLHOOKSTRUCT));
+                    if ((k2.vkCode == 0x41 || k2.vkCode == 0x42) && ChordFired)
+                    {
+                        // 松开 A/B 就相当于「松手」：启动当前悬停的应用
+                        ChordFired = false;
+                        System.Windows.Application.Current.Dispatcher.BeginInvoke(new Action(() => { var c = ChordRelease; if (c != null) c(); }));
+                        return (IntPtr)1;
+                    }
                     if (k2.vkCode == 0x09 && TabDown)
                     {
                         TabDown = false;
-                        if (!ChordFired && !AcceptInjected) Native.KeyTap(0x09);
+                        if (!ChordFired && !ChordUsed && !AcceptInjected) Native.KeyTap(0x09);
+                        ChordUsed = false;
                         return (IntPtr)1;
                     }
                 }
@@ -1360,6 +1395,13 @@ class WheelApp : Application
                 CloseWheel();
                 if (a2 != null) Launcher.Run(a2);
             };
+            MouseHook.ChordRelease = delegate
+            {
+                if (wheel == null) return;
+                var a3 = wheel.Commit();
+                CloseWheel();
+                if (a3 != null) Launcher.Run(a3);
+            };
             hook.Escape += OnEscape;
             MouseHook.WheelOpen = delegate { return wheel != null; };
             hook.Install(Settings.TabHotkey);
@@ -1369,11 +1411,11 @@ class WheelApp : Application
             tray.Icon = LoadExeIcon() ?? MakeIcon();
             tray.Text = "轮盘启动器";
             tray.Visible = true;
-            tray.DoubleClick += (s, a) => ShowAtCursor();
+            tray.DoubleClick += (s, a) => { };
             tray.MouseClick += delegate (object s, WF.MouseEventArgs a) { if (a.Button == WF.MouseButtons.Left) ShowAtCursor(); };
             var menu = new WF.ContextMenuStrip();
             menu.Items.Add("显示轮盘 (测试)", null, (s, a) => ShowAtCursor());
-            menu.Items.Add("重新扫描应用", null, (s, a) => { apps = Scanner.FromDesktop(); });
+            menu.Items.Add("重新扫描应用", null, (s, a) => RescanAsync());
             menu.Items.Add("添加应用…", null, (s, a) => OpenAddDialog());
             menu.Items.Add("设置…", null, (s, a) => OpenSettings());
             var snd = new WF.ToolStripMenuItem("选中音效") { CheckOnClick = true, Checked = Settings.SoundOn };
@@ -1429,7 +1471,7 @@ class WheelApp : Application
             p.Children.Add(new TextBlock { Text = "选中音效音量", Foreground = fg, FontSize = 15, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 6, 0, 0) });
             var lbVol = new TextBlock { Text = Settings.Volume + " %", Foreground = fg, FontSize = 12, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 0, 0, 10) };
             var slVol = new Slider { Minimum = 0, Maximum = 100, Value = Settings.Volume, TickFrequency = 5, IsSnapToTickEnabled = true };
-            slVol.ValueChanged += (s, a) => { lbVol.Text = ((int)slVol.Value) + " %"; Click.SetVolume((int)slVol.Value); Click.Test(); };
+            slVol.ValueChanged += (s, a) => { lbVol.Text = ((int)slVol.Value) + " %"; Click.SetVolume((int)slVol.Value); };
             p.Children.Add(slVol);
             p.Children.Add(lbVol);
 
@@ -1607,6 +1649,7 @@ class WheelApp : Application
         void OnUp(int btn, int x, int y)
         {
             if (!pressed) return;
+            if (wheel != null && btn != downBtn) return;   // 另一个侧键的抬起不参与提交
             pressed = false;
             if (wheel != null)
             {
@@ -1798,6 +1841,7 @@ static int Cap(double radius, double icon)
 
         void ShowAtCursor()
         {
+            if (wheel != null) { CloseWheel(); return; }   // 再点一次托盘就是收起
             Native.POINT p;
             Native.GetCursorPos(out p);
             ShowWheel(0, p.x, p.y, p.x, p.y);
