@@ -6,7 +6,7 @@
 
 ## 下载
 
-- **[WheelLauncher-v0.1.2-win-x64.zip](https://github.com/wodemi/wheel-launcher/releases/latest/download/WheelLauncher-v0.1.2-win-x64.zip)** — 约 104 KB，解压后双击 `WheelLauncher.exe` 就能用（.NET Framework 4.8 系统自带，无需安装任何运行库）。
+- **[WheelLauncher-v0.1.3-win-x64.zip](https://github.com/wodemi/wheel-launcher/releases/latest/download/WheelLauncher-v0.1.3-win-x64.zip)** — 约 106 KB，解压后双击 `WheelLauncher.exe` 就能用（.NET Framework 4.8 系统自带，无需安装任何运行库）。
 - 历史版本与更新说明：[Releases](https://github.com/wodemi/wheel-launcher/releases)
 
 ## 截图
@@ -26,6 +26,7 @@
 - **中心「+」**：添加桌面上没有的程序（会记住，下次重扫不会丢）。
 - **托盘常驻**：左键单击呼出轮盘，右键菜单有设置、重新扫描、添加应用、开机自启、退出；双击桌面快捷方式也会唤醒已运行的实例并弹出轮盘。
 - **自动重扫**：每 3 分钟扫描一次桌面，新装的软件不用手动加。
+- **打游戏自动让路**：检测到游戏（游戏目录下的程序，或无边框独占全屏）时，侧键与 Tab 快捷键全部原样放行，轮盘不弹、按键不吞；回到桌面自动恢复。可在托盘菜单关掉。
 
 ## 使用方法
 
