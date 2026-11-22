@@ -7,7 +7,7 @@ Windows 10 / 11 x64，单文件免安装，不依赖运行库。
 
 ## 下载
 
-**[⬇ WheelLauncher-v0.2.0-win-x64.zip](../../releases/latest/download/WheelLauncher-v0.2.0-win-x64.zip)**（解压即用，约 260 KB）
+**[⬇ WheelLauncher-v0.2.0-win-x64.zip](https://github.com/wodemi/wheel-launcher/releases/latest/download/WheelLauncher-v0.2.0-win-x64.zip)**（解压即用，约 260 KB）
 
 ## 三种呼出方式
 
@@ -93,4 +93,4 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 
 ## 许可
 
-MIT，见 [LICENSE](LICENSE)。
+MIT，见 [LICENSE](https://github.com/wodemi/wheel-launcher/blob/main/LICENSE)。
