@@ -31,31 +31,65 @@ namespace WheelLauncher
     public static class Log
     {
         static readonly object Gate = new object();
-        public static void W(string msg)
+        static readonly System.Collections.Concurrent.ConcurrentQueue<string> Pending = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        static System.Threading.Thread writer;
+
+        static void Ensure()
         {
+            if (writer != null) return;
+            lock (Gate)
+            {
+                if (writer != null) return;
+                writer = new System.Threading.Thread(WriterLoop);
+                writer.IsBackground = true;
+                writer.Start();
+            }
+        }
+
+        static void WriterLoop()
+        {
+            while (true)
+            {
+                try { Flush(); } catch { }
+                System.Threading.Thread.Sleep(200);
+            }
+        }
+
+        static void Flush()
+        {
+            if (Pending.IsEmpty) return;
+            var sb = new StringBuilder();
+            string s;
+            while (Pending.TryDequeue(out s))
+            {
+                sb.Append(DateTime.Now.ToString("HH:mm:ss.fff")).Append("  ").Append(s).Append("\r\n");
+                if (sb.Length > 8192) break;
+            }
+            if (sb.Length == 0) return;
             try
             {
-                lock (Gate)
+                Directory.CreateDirectory(Paths.Root);
+                string file = System.IO.Path.Combine(Paths.Root, "log.txt");
+                try
                 {
-                    Directory.CreateDirectory(Paths.Root);
-                    string file = System.IO.Path.Combine(Paths.Root, "log.txt");
-                    try
+                    var fi = new FileInfo(file);
+                    if (fi.Exists && fi.Length > 1048576)
                     {
-                        var fi = new FileInfo(file);
-                        if (fi.Exists && fi.Length > 1048576)
-                        {
-                            string old = System.IO.Path.Combine(Paths.Root, "log.1.txt");
-                            try { if (File.Exists(old)) File.Delete(old); } catch { }
-                            try { File.Move(file, old); }
-                            catch { try { File.WriteAllText(file, ""); } catch { } }
-                        }
+                        string old = System.IO.Path.Combine(Paths.Root, "log.1.txt");
+                        try { if (File.Exists(old)) File.Delete(old); } catch { }
+                        try { File.Move(file, old); } catch { try { File.WriteAllText(file, ""); } catch { } }
                     }
-                    catch { }
-                    File.AppendAllText(file,
-                        DateTime.Now.ToString("HH:mm:ss.fff") + "  " + msg + "\r\n", Encoding.UTF8);
                 }
+                catch { }
+                File.AppendAllText(file, sb.ToString(), Encoding.UTF8);
             }
             catch { }
+        }
+
+        public static void W(string msg)
+        {
+            Ensure();
+            try { Pending.Enqueue(msg); } catch { }
         }
     }
 
@@ -131,6 +165,7 @@ namespace WheelLauncher
         }
 
         static readonly Dictionary<string, ImageSource> Cache = new Dictionary<string, ImageSource>(StringComparer.OrdinalIgnoreCase);
+        static void Put(string key, ImageSource img) { if (Cache.Count > 400) Cache.Clear(); Cache[key] = img; }
 
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
         static extern IntPtr SHGetFileInfo(string pszPath, uint dwFileAttributes, ref SHFILEINFO psfi, uint cbFileInfo, uint uFlags);
@@ -178,16 +213,16 @@ namespace WheelLauncher
                 if (Directory.Exists(exePath))
                 {
                     src = FromShellPath(exePath);
-                    Cache[exePath] = src;
+                    Put(exePath, src);
                     return src;
                 }
-                if (!File.Exists(exePath)) { Cache[exePath] = null; return null; }
+                if (!File.Exists(exePath)) { Put(exePath, null); return null; }
                 src = FromShell(exePath);
                 if (src == null)
                 {
                     using (System.Drawing.Icon ico = System.Drawing.Icon.ExtractAssociatedIcon(exePath))
                     {
-                        if (ico == null) { Cache[exePath] = null; return null; }
+                        if (ico == null) { Put(exePath, null); return null; }
                         var bmp = Imaging.CreateBitmapSourceFromHIcon(ico.Handle, Int32Rect.Empty,
                             BitmapSizeOptions.FromEmptyOptions());
                         bmp.Freeze();
@@ -196,7 +231,7 @@ namespace WheelLauncher
                 }
             }
             catch { src = null; }
-            Cache[exePath] = src;
+            Put(exePath, src);
             return src;
         }
     }
@@ -618,8 +653,8 @@ namespace WheelLauncher
             bd.SetValue(Border.SnapsToDevicePixelsProperty, true);
             var cp = new FrameworkElementFactory(typeof(ContentPresenter));
             cp.SetValue(FrameworkElement.MarginProperty, new TemplateBindingExtension(Control.PaddingProperty));
-            cp.SetValue(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Center);
-            cp.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
+            cp.SetValue(FrameworkElement.HorizontalAlignmentProperty, new TemplateBindingExtension(Control.HorizontalContentAlignmentProperty));
+            cp.SetValue(FrameworkElement.VerticalAlignmentProperty, new TemplateBindingExtension(Control.VerticalContentAlignmentProperty));
             bd.AppendChild(cp);
             tpl.VisualTree = bd;
             b.Template = tpl;
@@ -728,13 +763,18 @@ namespace WheelLauncher
             return new TextBlock { Text = text, FontSize = 12, Foreground = Br(SubCol), Margin = new Thickness(0, 0, 0, 6) };
         }
 
+        public static Color Mix(Color a, Color b, double k) { return Color.FromRgb((byte)(a.R + (b.R - a.R) * k), (byte)(a.G + (b.G - a.G) * k), (byte)(a.B + (b.B - a.B) * k)); }
+
+        public static string Hex(Color c) { return "#" + c.R.ToString("X2") + c.G.ToString("X2") + c.B.ToString("X2"); }
+
         public static void Skin(ListView lv, GridView gv)
         {
             var headTpl = new Style(typeof(GridViewColumnHeader));
             headTpl.Setters.Add(new Setter(GridViewColumnHeader.BackgroundProperty, Br(HeadCol)));
             headTpl.Setters.Add(new Setter(GridViewColumnHeader.ForegroundProperty, Br(SubCol)));
             headTpl.Setters.Add(new Setter(GridViewColumnHeader.BorderBrushProperty, Br(LineCol)));
-            headTpl.Setters.Add(new Setter(GridViewColumnHeader.PaddingProperty, new Thickness(8, 6, 8, 6)));
+            headTpl.Setters.Add(new Setter(GridViewColumnHeader.PaddingProperty, new Thickness(10, 8, 10, 8)));
+            headTpl.Setters.Add(new Setter(Control.FontSizeProperty, 11.5));
             headTpl.Setters.Add(new Setter(Control.FontWeightProperty, FontWeights.Normal));
             headTpl.Setters.Add(new Setter(Control.CursorProperty, System.Windows.Input.Cursors.Arrow));
             var headView = new ControlTemplate(typeof(GridViewColumnHeader));
@@ -745,7 +785,7 @@ namespace WheelLauncher
             hb.SetValue(Border.PaddingProperty, new TemplateBindingExtension(Control.PaddingProperty));
             hb.SetValue(Border.SnapsToDevicePixelsProperty, true);
             var hcp = new FrameworkElementFactory(typeof(ContentPresenter));
-            hcp.SetValue(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Center);
+            hcp.SetValue(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Left);
             hcp.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
             hb.AppendChild(hcp);
             headView.VisualTree = hb;
@@ -758,19 +798,26 @@ namespace WheelLauncher
             lv.BorderThickness = new Thickness(1);
             lv.FontSize = 12.5;
 
+            // 行模板：默认模板选中时会画一圈系统白边，很扎眼 → 自绘圆角底，选中只用配色区分
+            string selHex = Hex(Mix(CardCol, AccentCol, Dark ? 0.34 : 0.30));
+            string hovHex = Hex(Mix(CardCol, AccentCol, Dark ? 0.14 : 0.12));
+            string rowXaml =
+                "<ControlTemplate xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' TargetType='ListViewItem'>"
+                + "<Border x:Name='bd' Background='{TemplateBinding Background}' Padding='{TemplateBinding Padding}' CornerRadius='4' SnapsToDevicePixels='True'>"
+                + "<GridViewRowPresenter VerticalAlignment='Center' Columns='{TemplateBinding GridView.ColumnCollection}'/>"
+                + "</Border>"
+                + "<ControlTemplate.Triggers>"
+                + "<Trigger Property='IsMouseOver' Value='True'><Setter TargetName='bd' Property='Background' Value='" + hovHex + "'/></Trigger>"
+                + "<Trigger Property='IsSelected' Value='True'><Setter TargetName='bd' Property='Background' Value='" + selHex + "'/></Trigger>"
+                + "</ControlTemplate.Triggers></ControlTemplate>";
             var item = new Style(typeof(ListViewItem));
-            item.Setters.Add(new Setter(ListViewItem.PaddingProperty, new Thickness(2, 4, 2, 4)));
+            item.Setters.Add(new Setter(ListViewItem.PaddingProperty, new Thickness(2, 5, 2, 5)));
             item.Setters.Add(new Setter(Control.ForegroundProperty, Br(InkCol)));
             item.Setters.Add(new Setter(Control.BackgroundProperty, Br(CardCol)));
+            item.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(0)));
+            item.Setters.Add(new Setter(Control.FocusVisualStyleProperty, null));
             item.Setters.Add(new Setter(Control.VerticalContentAlignmentProperty, VerticalAlignment.Center));
-            var hov = new Trigger { Property = ListViewItem.IsMouseOverProperty, Value = true };
-            hov.Setters.Add(new Setter(Control.BackgroundProperty, Br(ChipHiCol)));
-            hov.Setters.Add(new Setter(Control.ForegroundProperty, Br(InkCol)));
-            item.Triggers.Add(hov);
-            var sel = new Trigger { Property = ListViewItem.IsSelectedProperty, Value = true };
-            sel.Setters.Add(new Setter(Control.BackgroundProperty, Br(SelBgCol)));
-            sel.Setters.Add(new Setter(Control.ForegroundProperty, Br(Dark ? Colors.White : InkCol)));
-            item.Triggers.Add(sel);
+            item.Setters.Add(new Setter(Control.TemplateProperty, System.Windows.Markup.XamlReader.Parse(rowXaml)));
             lv.ItemContainerStyle = item;
 
             // 滚动条：默认模板是浅色系统主题（深色下发白、看不清）→ 用 XAML 模板换成调色板色
@@ -807,6 +854,9 @@ namespace WheelLauncher
             var trigH = new Trigger { Property = System.Windows.Controls.Primitives.ScrollBar.OrientationProperty, Value = Orientation.Horizontal };
             trigH.Setters.Add(new Setter(Control.TemplateProperty, System.Windows.Markup.XamlReader.Parse(horizXaml)));
             sbStyle.Triggers.Add(trigH);
+            // ScrollViewer 模板：横竖滚动条交叉处默认是系统白块，染成卡片色
+
+            // 妯珫婊氬姩鏉′氦鍙夎榛樿鐢?SystemColors.ControlBrush锛堢櫧鍧楋級鈫?鎹㈡垚鍗＄墖搴曡壊
             lv.Resources.Add(typeof(System.Windows.Controls.Primitives.ScrollBar), sbStyle);
         }
         // 滑块模板：默认模板在深/浅两套底色上都看不清，改成细轨 + 圆点
@@ -947,100 +997,842 @@ namespace WheelLauncher
 
     public static class GameWatch
     {
-        public static volatile bool Suspended;
-        public static string Reason = "";
-        public static Action<bool> Changed;
-        static System.Threading.Thread th;
+        static readonly string[] NotGame = { "explorer", "chrome", "msedge", "firefox", "code", "discord", "wechat", "weixin",
+            "qq", "notepad", "powershell", "pwsh", "cmd", "windowsterminal", "conhost", "applicationframehost",
+            "searchhost", "startmenuexperiencehost", "shellexperiencehost", "taskmgr", "devenv", "sublime_text",
+            "spotify", "vlc", "wmplayer", "musicbee", "obs64", "obs32", "doubao", "bandizip", "winrar", "7zfm",
+            "lockapp", "lockapphost", "logonui", "textinputhost", "ctfmon", "widgets", "searchapp", "searchui",
+            "sihost", "useroobebroker", "nahimic3", "nahimicsvc", "audiodg", "rundll32", "dllhost", "sppsvc",
+            "sticky notes", "stickynotes", "calculatorapp", "photos", "photoshop", "illustrator", "word", "excel",
+            "powerpnt", "wps", "wpp", "et", "acrobat", "acrord32", "foxitreader", "thunderbird", "outlook" };
 
-        public static void Start()
+        static readonly string[] GameDirs = { "\\steamapps\\common\\", "\\steam library\\", "\\epic games\\", "\\gog games\\",
+            "\\gog galaxy\\games\\", "\\wegameapps\\", "\\riot games\\", "\\battle.net\\", "\\ea games\\", "\\origin games\\",
+            "\\xboxgames\\", "\\ubisoft\\", "\\ubisoft game launcher\\games\\", "\\my games\\", "\\game\\", "\\games\\" };
+
+        static readonly string[] StoreExes = { "steam", "epicgameslauncher", "wegame", "wegames", "riotclientservices",
+            "battle.net", "origin", "eaapp", "eadesktop", "ubisoftconnect", "ubisoftgamelauncher", "upc",
+            "galaxylauncher", "gamingservices", "gamingservicesnet", "itch", "goggalaxy" };
+
+        static readonly string[] AccelExes = { "biubiu", "biubiu_nets_proxy", "biubiuacc", "glacc", "uugame", "neteaseuu",
+            "xunyou", "leigod", "ghelper" };
+
+        public static volatile bool Suspended;
+        public static volatile bool AccelFg;
+        public static volatile string FgExe = "";
+        public static bool Paused { get { return Suspended || AccelFg; } }
+        public static Action<bool> Changed;
+
+        static GameWatch()
         {
-            if (th != null) return;
-            th = new System.Threading.Thread(Loop);
-            th.IsBackground = true;
-            th.Start();
+            var t = new System.Threading.Thread(Loop);
+            t.IsBackground = true;
+            t.Name = "gamewatch";
+            t.Start();
+            Log.W("gamewatch started");
         }
 
         static void Loop()
         {
             while (true)
             {
-                try { Scan(); } catch (Exception ex) { Log.W("gamewatch error: " + ex.Message); }
                 System.Threading.Thread.Sleep(1200);
+                try { Scan(); } catch (Exception ex) { Log.W("gamewatch error: " + ex.Message); }
             }
         }
 
-        static readonly string[] NotGame = { "explorer", "chrome", "msedge", "firefox", "opera", "brave", "vivaldi",
-            "code", "devenv", "discord", "telegram", "wechat", "weixin", "qq", "notepad", "powershell", "pwsh",
-            "cmd", "windowsterminal", "wt", "applicationframehost", "searchhost", "startmenuexperiencehost",
-            "shellexperiencehost", "dwm", "taskmgr", "systemsettings", "photos", "mspaint", "word", "excel",
-            "powerpnt", "wps", "acrobat", "zotero", "spotify", "vlc", "bilibili", "potplayermini64" };
-
-        static readonly string[] GameDirs = { "\\steamapps\\common\\", "\\epic games\\", "\\gog games\\", "\\wegameapps\\",
-            "\\riot games\\", "\\battle.net\\", "\\ea games\\", "\\origin games\\", "\\xboxgames\\", "\\game\\", "\\games\\" };
-
-        static void Scan()
+        public static string ExeName(string path)
         {
-            bool now = false; string why = "";
-            if (Settings.AutoPause)
+            if (string.IsNullOrEmpty(path)) return "";
+            try { return System.IO.Path.GetFileName(path).ToLowerInvariant(); } catch { return ""; }
+        }
+
+        public static string Bare(string exe)
+        {
+            if (string.IsNullOrEmpty(exe)) return "";
+            string s = exe.Trim().ToLowerInvariant();
+            if (s.EndsWith(".exe")) s = s.Substring(0, s.Length - 4);
+            return s;
+        }
+
+        public static bool IsStoreExe(string exe) { return Array.IndexOf(StoreExes, Bare(exe)) >= 0; }
+        public static bool IsAccelExe(string exe) { return Array.IndexOf(AccelExes, Bare(exe)) >= 0; }
+
+        public static string PidPath(int pid)
+        {
+            IntPtr h = Native.OpenProcess(0x1000, false, pid);
+            if (h != IntPtr.Zero)
             {
-                IntPtr h = Native.GetForegroundWindow();
-                if (h != IntPtr.Zero) now = IsGame(h, out why);
+                try
+                {
+                    var sb = new System.Text.StringBuilder(1024);
+                    int size = 1024;
+                    if (Native.QueryFullProcessImageName(h, 0, sb, ref size)) return sb.ToString();
+                }
+                finally { Native.CloseHandle(h); }
             }
-            if (now != Suspended)
+            try { return System.Diagnostics.Process.GetProcessById(pid).MainModule.FileName; }
+            catch { return ""; }
+        }
+
+        static System.Collections.Generic.Dictionary<int, int> ParentMap()
+        {
+            var map = new System.Collections.Generic.Dictionary<int, int>();
+            IntPtr snap = Native.CreateToolhelp32Snapshot(0x2, 0);
+            if (snap == IntPtr.Zero || snap == new IntPtr(-1)) return map;
+            try
             {
-                Suspended = now;
-                Reason = why;
-                Log.W("gamewatch: " + (now ? "suspend (" + why + ")" : "resume"));
-                var c = Changed;
-                if (c != null) { try { c(now); } catch { } }
+                var pe = new Native.PROCESSENTRY32();
+                pe.dwSize = (uint)System.Runtime.InteropServices.Marshal.SizeOf(typeof(Native.PROCESSENTRY32));
+                if (Native.Process32First(snap, ref pe))
+                {
+                    do
+                    {
+                        map[(int)pe.th32ProcessID] = (int)pe.th32ParentProcessID;
+                        pe.dwSize = (uint)System.Runtime.InteropServices.Marshal.SizeOf(typeof(Native.PROCESSENTRY32));
+                    } while (Native.Process32Next(snap, ref pe));
+                }
             }
+            finally { Native.CloseHandle(snap); }
+            return map;
+        }
+
+        public static bool IsGame(IntPtr h, out string why)
+        {
+            why = "-";
+            if (h == IntPtr.Zero) return false;
+            int pid;
+            Native.GetWindowThreadProcessId(h, out pid);
+            string path = PidPath(pid);
+            string exe = ExeName(path);
+            if (exe.Length == 0) return false;
+            string bare = exe.EndsWith(".exe") ? exe.Substring(0, exe.Length - 4) : exe;
+            if (Array.IndexOf(NotGame, bare) >= 0) return false;
+
+            if (IsStoreExe(bare))
+            {
+                if (Settings.PauseOnStore) { why = "storeui:" + bare; return true; }
+                return false;
+            }
+            if (path.Length > 0 && GameList.Match(path)) { why = "manual:" + exe; return true; }
+            if (path.Length > 0)
+            {
+                string low = path.ToLowerInvariant();
+                foreach (var d in GameDirs) { if (low.Contains(d)) { why = "path:" + d.Trim('\\'); return true; } }
+            }
+            try
+            {
+                var map = ParentMap();
+                int cur = (int)pid;
+                for (int depth = 0; depth < 3; depth++)
+                {
+                    int parent;
+                    if (!map.TryGetValue(cur, out parent) || parent <= 0) break;
+                    string pp = PidPath(parent);
+                    string pe = ExeName(pp);
+                    string pbare = pe.EndsWith(".exe") ? pe.Substring(0, pe.Length - 4) : pe;
+                    if (IsStoreExe(pbare)) { why = "store:" + pbare + ">" + bare; return true; }
+                    cur = parent;
+                }
+            }
+            catch { }
+
+            int quns = 0;
+            if (Native.SHQueryUserNotificationState(out quns) >= 0 && quns == 3) { why = "d3d-fullscreen:" + bare; return true; }
+
+            try
+            {
+                var r = new Native.RECT();
+                Native.GetWindowRect(h, out r);
+                var scr = WF.Screen.FromHandle(h).Bounds;
+                bool covers = Math.Abs(r.Left - scr.Left) <= 2 && Math.Abs(r.Top - scr.Top) <= 2 &&
+                               Math.Abs(r.Right - scr.Right) <= 2 && Math.Abs(r.Bottom - scr.Bottom) <= 2;
+                long style = Native.GetWindowLongPtr(h, -16).ToInt64();
+                bool caption = (style & 0x00C00000) == 0x00C00000;
+                bool popup = (style & 0x80000000L) != 0;
+                if (covers && (!caption || popup)) { why = "fullscreen:" + bare; return true; }
+            }
+            catch { }
+            return false;
         }
 
         public static bool IsGamePath(string path)
         {
             if (string.IsNullOrEmpty(path)) return false;
             if (GameList.Match(path)) return true;
-            string lp = path.ToLowerInvariant();
-            for (int i = 0; i < GameDirs.Length; i++) if (lp.Contains(GameDirs[i])) return true;
+            string low = path.ToLowerInvariant();
+            foreach (var d in GameDirs) { if (low.Contains(d)) return true; }
             return false;
         }
 
-        static bool IsGame(IntPtr h, out string why)
+        static void Scan()
         {
-            why = "";
-            uint pid;
-            Native.GetWindowThreadProcessId(h, out pid);
-            if (pid == 0) return false;
-            string exe = "", path = "";
+            IntPtr fg = Native.GetForegroundWindow();
+            string fex = "";
+            if (fg != IntPtr.Zero)
+            {
+                int pid;
+                Native.GetWindowThreadProcessId(fg, out pid);
+                fex = ExeName(PidPath(pid));
+            }
+            FgExe = fex;
+            string bare = fex.EndsWith(".exe") ? fex.Substring(0, fex.Length - 4) : fex;
+
+            bool accel = Settings.PauseAccel && !WheelApp.IsElevated && IsAccelExe(bare);
+            if (accel != AccelFg)
+            {
+                AccelFg = accel;
+                Log.W(accel ? ("accel pause (" + bare + ")") : "accel resume");
+            }
+
+            string why; bool game = IsGame(fg, out why);
+            if (game != Suspended)
+            {
+                Suspended = game;
+                if (game) Log.W("gamewatch: suspend (" + why + ")");
+                else Log.W("gamewatch: resume");
+                var ch = Changed;
+                if (ch != null) ch(game);
+            }
+        }
+
+        public static void Start() { }
+        public static void Probe(int seconds)
+        {
+            var t = new System.Threading.Thread(delegate ()
+            {
+                int end = Environment.TickCount + seconds * 1000;
+                while (Environment.TickCount < end)
+                {
+                    IntPtr h = Native.GetForegroundWindow();
+                    int pid;
+                    Native.GetWindowThreadProcessId(h, out pid);
+                    int quns = 0;
+                    Native.SHQueryUserNotificationState(out quns);
+                    string why; bool g = IsGame(h, out why);
+                    Log.W("gameprobe fg=" + ExeName(PidPath((int)pid)) + " game=" + g + " why=" + why + " quns=" + quns);
+                    System.Threading.Thread.Sleep(1500);
+                }
+                Log.W("gameprobe done");
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        public static void TestPid(int pid)
+        {
+            string ppath = PidPath(pid);
+            IntPtr hwnd = IntPtr.Zero;
+            try { hwnd = System.Diagnostics.Process.GetProcessById(pid).MainWindowHandle; } catch { }
+            string why; bool g = IsGame(hwnd, out why);
+            Log.W("gametest pid=" + pid + " hwnd=" + hwnd + " game=" + g + " why=" + why + " path=" + ppath);
+        }
+    }
+
+    // ===== 自检（--selftest）：纯逻辑断言，不开窗、不影响常驻运行 =====
+    public static class SelfTest
+    {
+        static int pass, fail;
+        static System.Text.StringBuilder sb;
+
+        static void C(string name, bool ok)
+        {
+            if (ok) pass++;
+            else { fail++; sb.AppendLine("FAIL  " + name); }
+        }
+
+        public static int Run()
+        {
+            sb = new System.Text.StringBuilder();
+            pass = 0; fail = 0;
             try
             {
-                var p = Process.GetProcessById((int)pid);
-                exe = (p.ProcessName ?? "").ToLowerInvariant();
-                try { path = (p.MainModule.FileName ?? "").ToLowerInvariant(); } catch { }
+                C("pinyin 微信=W", Pinyin.Get("微信") == 'W');
+                C("pinyin 文档=W", Pinyin.Get("文档") == 'W');
+                C("pinyin 下载=X", Pinyin.Get("下载") == 'X');
+                C("pinyin QQ=Q", Pinyin.Get("QQ") == 'Q');
+                C("pinyin DeepSeek=D", Pinyin.Get("DeepSeek Harness") == 'D');
+                C("pinyin 数字=#", Pinyin.Get("360安全") == '#');
+
+                C("hex", Ui.Hex(System.Windows.Media.Color.FromRgb(1, 2, 3)) == "#010203");
+                System.Windows.Media.Color mid = Ui.Mix(System.Windows.Media.Colors.Black, System.Windows.Media.Colors.White, 0.5);
+                C("mix 50%", mid.R == 127 && mid.G == 127 && mid.B == 127);
+
+                C("skin names=6", WheelSkin.Names.Length == 6);
+                int wi = WheelSkin.Index;
+                C("skin index in range", wi >= 0 && wi < WheelSkin.Names.Length);
+
+                C("store steam", GameWatch.IsStoreExe("steam"));
+                C("store epic", GameWatch.IsStoreExe("epicgameslauncher"));
+                C("exename steam.exe", GameWatch.ExeName(@"C:\Program Files (x86)\Steam\steam.exe") == "steam.exe");
+                C("store steam.exe", GameWatch.IsStoreExe("Steam.EXE"));
+                C("accel biubiu", GameWatch.IsAccelExe("biubiu"));
+                C("accel glacc.exe", GameWatch.IsAccelExe("glacc.exe"));
+                C("not accel chrome", !GameWatch.IsAccelExe("chrome.exe"));
+
+                C("gamepath steamlib", GameWatch.IsGamePath(@"D:\SteamLibrary\steamapps\common\Stardew Valley\Stardew Valley.exe"));
+                C("gamepath explorer=false", !GameWatch.IsGamePath(@"C:\Windows\explorer.exe"));
+
+                int ov = Settings.Volume;
+                Settings.Volume = 37;
+                C("settings volume write", Settings.Volume == 37);
+                Settings.Volume = ov;
+                C("settings volume restore", Settings.Volume == ov);
+                C("settings longpress 250..2000", Settings.LongPress >= 250 && Settings.LongPress <= 2000);
+                C("settings wheelsize 70..140", Settings.WheelSize >= 70 && Settings.WheelSize <= 140);
+
+                string tmpDir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "wl_selftest_dir");
+                string customPath = System.IO.Path.Combine(Paths.Root, "custom.txt");
+                Scanner.AddCustom("__selftest__", tmpDir, "");
+                string raw = System.IO.File.Exists(customPath) ? System.IO.File.ReadAllText(customPath, System.Text.Encoding.UTF8) : "";
+                C("custom add", raw.Contains("__selftest__"));
+                C("custom remove", Scanner.RemoveCustom(tmpDir));
+                raw = System.IO.File.Exists(customPath) ? System.IO.File.ReadAllText(customPath, System.Text.Encoding.UTF8) : "";
+                C("custom removed", raw.IndexOf("__selftest__") < 0);
+
+                string gp = System.IO.Path.Combine(tmpDir, "a.exe");
+                GameList.Add(tmpDir);
+                C("gamelist match", GameList.Match(gp));
+                C("gamelist remove", GameList.Remove(tmpDir));
+                C("gamelist unmatched", !GameList.Match(gp));
+
+                C("icon notepad", Icons.Get(@"C:\Windows\System32\notepad.exe") != null);
+                C("paths root exists", System.IO.Directory.Exists(Paths.Root));
+                C("hotkey vk F7", 0x76 == 118 && 0x77 == 119);
             }
-            catch { return false; }
-            for (int i = 0; i < NotGame.Length; i++) if (exe == NotGame[i]) return false;
-            if (path.Length > 0)
+            catch (Exception ex)
             {
-                if (GameList.Match(path)) { why = "manual:" + exe; return true; }
-                for (int i = 0; i < GameDirs.Length; i++)
-                    if (path.Contains(GameDirs[i])) { why = "path:" + exe; return true; }
+                fail++;
+                sb.AppendLine("FAIL  exception: " + ex.GetType().Name + ": " + ex.Message);
             }
-            Native.RECT r;
-            if (!Native.GetWindowRect(h, out r)) return false;
-            var scr = WF.Screen.FromHandle(h).Bounds;
-            bool covers = r.Left <= scr.Left && r.Top <= scr.Top && r.Right >= scr.Right && r.Bottom >= scr.Bottom;
-            long style = Native.GetWindowLongPtr(h, -16).ToInt64() & 0xFFFFFFFFL;
-            bool caption = (style & 0x00C00000L) != 0;
-            bool popup = (style & 0x80000000L) != 0;
-            if (covers && !caption && popup) { why = "fullscreen:" + exe; return true; }
-            return false;
+            string head = "SELFTEST pass=" + pass + " fail=" + fail;
+            sb.Insert(0, head + Environment.NewLine);
+            try { System.IO.File.WriteAllText(System.IO.Path.Combine(Paths.Root, "selftest.txt"), sb.ToString(), System.Text.Encoding.UTF8); }
+            catch { }
+            try { Log.W(head); } catch { }
+            return fail == 0 ? 0 : 1;
         }
+    }
+    // ===== 手柄：L3+Start 呼出，左摇杆选方向，A 确认，B 取消 =====
+    public static class Gamepad
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct XINPUT_GAMEPAD
+        {
+            public ushort wButtons; public byte bLeftTrigger; public byte bRightTrigger;
+            public short sThumbLX; public short sThumbLY; public short sThumbRX; public short sThumbRY;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct XINPUT_STATE { public uint dwPacketNumber; public XINPUT_GAMEPAD Gamepad; }
+
+        [DllImport("xinput1_4.dll", EntryPoint = "XInputGetState")]
+        static extern int XInputGetState14(int dwUserIndex, out XINPUT_STATE pState);
+        [DllImport("xinput9_1_0.dll", EntryPoint = "XInputGetState")]
+        static extern int XInputGetState91(int dwUserIndex, out XINPUT_STATE pState);
+
+        const ushort BTN_LB = 0x0100, BTN_RB = 0x0200;
+        const ushort BTN_DPAD_UP = 0x0001, BTN_DPAD_DOWN = 0x0002, BTN_DPAD_LEFT = 0x0004, BTN_DPAD_RIGHT = 0x0008;
+        const ushort BTN_START = 0x0010, BTN_VIEW = 0x0020, BTN_L3 = 0x0040, BTN_A = 0x1000, BTN_B = 0x2000;
+
+        public static Action<int, int> Nav;
+        public static Action<double, double> Stick;   // 左摇杆连续向量，用于丝滑跟随
+        public static Action<int> Trigger;   // 1=A-M（L3+视图键）, 2=N-Z（L3+菜单键）
+        public static Action<int> Page;      // 肩键翻页
+        public static Action Commit;
+        public static Action Cancel;
+        public static volatile bool Connected;
+
+        static int GetState(int i, out XINPUT_STATE st)
+        {
+            try { return XInputGetState14(i, out st); }
+            catch { try { return XInputGetState91(i, out st); } catch { st = new XINPUT_STATE(); return 1; } }
+        }
+
+        public static void Start()
+        {
+            var th = new System.Threading.Thread(Loop);
+            th.IsBackground = true; th.Name = "gamepad"; th.Start();
+            Log.W("gamepad thread started");
+        }
+
+        static void Loop()
+        {
+            int lastDx = 0, lastDy = 0, nextDirAt = 0;
+            bool comboViewArm = true, comboStartArm = true, aWas = false, bWas = false, wasOn = false, lbWas = false, rbWas = false;
+            while (true)
+            {
+                System.Threading.Thread.Sleep(60);
+                try
+                {
+                    XINPUT_STATE st = new XINPUT_STATE(); bool any = false;
+                    for (int i = 0; i < 4; i++) { if (GetState(i, out st) == 0) { any = true; break; } }
+                    if (any != wasOn) { wasOn = any; Log.W("gamepad " + (any ? "connected" : "disconnected")); }
+                    Connected = any;
+                    if (!any) { lastDx = 0; lastDy = 0; continue; }
+
+                    ushort b = st.Gamepad.wButtons;
+                    bool l3 = (b & BTN_L3) != 0;
+                    bool comboView = l3 && (b & BTN_VIEW) != 0;
+                    bool comboStart = l3 && (b & BTN_START) != 0;
+                    if (comboView)
+                    {
+                        if (comboViewArm) { comboViewArm = false; var tr = Trigger; if (tr != null) tr(1); }
+                    }
+                    else comboViewArm = true;
+                    if (comboStart)
+                    {
+                        if (comboStartArm) { comboStartArm = false; var tr = Trigger; if (tr != null) tr(2); }
+                    }
+                    else comboStartArm = true;
+
+                    // 左摇杆：输出连续向量给 UI 做丝滑跟随
+                    double sxv = st.Gamepad.sThumbLX / 32767.0, syv = st.Gamepad.sThumbLY / 32767.0;
+                    double mag2 = Math.Sqrt(sxv * sxv + syv * syv);
+                    if (mag2 > 0.22)
+                    {
+                        var sk = Stick;
+                        if (sk != null) sk(sxv, -syv);
+                    }
+
+                    // 十字键 = 方向，原理与 WASD 一致（组合键出斜向）
+                    int ddx = 0, ddy = 0;
+                    if ((b & BTN_DPAD_RIGHT) != 0) ddx += 1;
+                    if ((b & BTN_DPAD_LEFT) != 0) ddx -= 1;
+                    if ((b & BTN_DPAD_DOWN) != 0) ddy += 1;
+                    if ((b & BTN_DPAD_UP) != 0) ddy -= 1;
+                    if (ddx != 0 || ddy != 0)
+                    {
+                        bool changed = ddx != lastDx || ddy != lastDy;
+                        if (changed || Environment.TickCount >= nextDirAt)
+                        {
+                            lastDx = ddx; lastDy = ddy; nextDirAt = Environment.TickCount + 260;
+                            var n = Nav;
+                            if (n != null) n(ddx, ddy);
+                        }
+                    }
+                    else { lastDx = 0; lastDy = 0; }
+
+                    bool lb = (b & BTN_LB) != 0, rb = (b & BTN_RB) != 0;
+                    if (lb && !lbWas) { var pg = Page; if (pg != null) pg(-1); }
+                    if (rb && !rbWas) { var pg = Page; if (pg != null) pg(1); }
+                    lbWas = lb; rbWas = rb;
+                    bool a = (b & BTN_A) != 0, bb = (b & BTN_B) != 0;
+                    if (a && !aWas) { var c = Commit; if (c != null) c(); }
+                    if (bb && !bWas) { var x = Cancel; if (x != null) x(); }
+                    aWas = a; bWas = bb;
+                }
+                catch { }
+            }
+        }
+    }
+    // ===== 方格面板：按首字母分行，适合“看得清、点得准” =====
+    public class GridWindow : Window
+    {
+        public List<AppEntry> Items = new List<AppEntry>();
+        public List<Ring> Rings { get { return new List<Ring>(); } }
+        public double MaxRadius { get { return 0; } }
+        public AppEntry Hovered;
+        public bool HubSelected { get { return gearSel; } }
+        public double WinScale { get { return winScale; } }
+
+        internal bool gearSel;
+
+        double winScale = 1;
+        Canvas cv;
+        TextBlock tip;
+        Border tipBar;
+        readonly List<Border> tiles = new List<Border>();
+        readonly List<TextBlock> caps = new List<TextBlock>();
+        readonly List<double> tcx = new List<double>();
+        readonly List<double> tcy = new List<double>();
+        List<List<KeyValuePair<char, List<AppEntry>>>> gPages = new List<List<KeyValuePair<char, List<AppEntry>>>>();
+        int gPage = 0;
+        double lastMaxW = 900, lastMaxH = 800;
+        double tW = 82, tH = 96, gapX = 10, gapY = 10, chipW = 26, padL = 18, padT = 16;
+        double contentW, contentH;
+        double curX, curY;
+        string caption = "";
+
+        public GridWindow(string title)
+        {
+            WindowStyle = WindowStyle.None;
+            AllowsTransparency = true;
+            Background = Brushes.Transparent;
+            ShowInTaskbar = false;
+            Topmost = true;
+            ShowActivated = false;
+            ResizeMode = ResizeMode.NoResize;
+            SnapsToDevicePixels = true;
+            UseLayoutRounding = true;
+            caption = title;
+        }
+
+        public void Build(List<AppEntry> list, double maxW, double maxH)
+        {
+            Items = list;
+            lastMaxW = maxW; lastMaxH = maxH;
+            var groups = new List<KeyValuePair<char, List<AppEntry>>>();
+            foreach (var g in list.GroupBy(a => a.Initial == '#' ? '[' : a.Initial).OrderBy(g2 => g2.Key))
+                groups.Add(new KeyValuePair<char, List<AppEntry>>(g.Key, g.ToList()));
+
+            int rowsPerCol0 = Math.Max(1, (int)Math.Floor((maxH - 90) / (88 + 10)));
+            int maxTiles = Math.Max(1, (int)Math.Floor((maxW - padL * 2 - 24) / (74 + 8)));
+            var rows = new List<KeyValuePair<char, List<AppEntry>>>();
+            foreach (var kv in groups)
+            {
+                for (int si = 0; si < kv.Value.Count; si += maxTiles)
+                {
+                    int cn = Math.Min(maxTiles, kv.Value.Count - si);
+                    rows.Add(new KeyValuePair<char, List<AppEntry>>(kv.Key, kv.Value.GetRange(si, cn)));
+                }
+            }
+            if (rows.Count == 0) rows.Add(new KeyValuePair<char, List<AppEntry>>('#', new List<AppEntry>()));
+            int perPage = Math.Max(1, rowsPerCol0 * 3);
+            gPages.Clear();
+            for (int i = 0; i < rows.Count; i += perPage)
+                gPages.Add(rows.GetRange(i, Math.Min(perPage, rows.Count - i)));
+            gPage = 0;
+            DrawGroups(gPages[0], maxW, maxH);
+        }
+
+        public int PageCount { get { return gPages.Count; } }
+        public int PageIndex { get { return gPage; } }
+
+        public void SetPage(int p)
+        {
+            if (p < 0 || p >= gPages.Count) return;
+            gPage = p;
+            DrawGroups(gPages[p], lastMaxW, lastMaxH);
+        }
+
+        void DrawGroups(List<KeyValuePair<char, List<AppEntry>>> groups, double maxW, double maxH)
+        {
+            tiles.Clear(); caps.Clear(); tcx.Clear(); tcy.Clear();
+            cv = new Canvas();
+            Content = cv;
+
+            tW = 74; tH = 88; gapX = 8; gapY = 10; chipW = 18;
+            int rowsPerCol = Math.Max(1, (int)Math.Floor((maxH - 70) / (tH + gapY)));
+            var cols = new List<List<KeyValuePair<char, List<AppEntry>>>>();
+            var curCol = new List<KeyValuePair<char, List<AppEntry>>>();
+            foreach (var kv in groups)
+            {
+                if (curCol.Count >= rowsPerCol) { cols.Add(curCol); curCol = new List<KeyValuePair<char, List<AppEntry>>>(); }
+                curCol.Add(kv);
+            }
+            if (curCol.Count > 0) cols.Add(curCol);
+
+            var colWs = new List<double>();
+            double totalW = 0;
+            foreach (var c0 in cols)
+            {
+                double w0 = 0;
+                foreach (var kv in c0) w0 = Math.Max(w0, chipW + kv.Value.Count * (tW + gapX));
+                colWs.Add(w0);
+                totalW += w0 + 18;
+            }
+            double maxRows = 0;
+            foreach (var c0 in cols) if (c0.Count > maxRows) maxRows = c0.Count;
+            contentW = padL * 2 + totalW;
+            contentH = padT * 2 + 26 + maxRows * (tH + gapY);
+            if (contentW > maxW)
+            {
+                double f = (maxW - padL * 2) / totalW;
+                tW *= f; tH *= f; chipW *= f;
+                contentW = maxW;
+                contentH = padT * 2 + 26 + maxRows * (tH + gapY);
+            }
+            Width = contentW;
+            Height = contentH;
+
+            var bg = new Border();
+            bg.Width = contentW; bg.Height = contentH;
+            bg.CornerRadius = new CornerRadius(16);
+            bg.Background = new LinearGradientBrush(Ui.BgCol, Ui.Mix(Ui.BgCol, Ui.CardCol, 0.9), 90);
+            bg.BorderBrush = new SolidColorBrush(Ui.LineCol);
+            bg.BorderThickness = new Thickness(1);
+            Canvas.SetLeft(bg, 0); Canvas.SetTop(bg, 0);
+            cv.Children.Add(bg);
+
+            var head = new TextBlock();
+            head.Text = caption + (gPages.Count > 1 ? "   " + (gPage + 1) + "/" + gPages.Count : "");
+            head.FontSize = 14.5;
+            head.Foreground = new SolidColorBrush(Ui.InkCol);
+            head.FontWeight = FontWeights.SemiBold;
+            Canvas.SetLeft(head, padL); Canvas.SetTop(head, 8);
+            cv.Children.Add(head);
+
+            double baseX = padL;
+            for (int ci = 0; ci < cols.Count; ci++)
+            {
+                double y = padT + 24;
+                foreach (var kv in cols[ci])
+                {
+                    double x = baseX;
+                    var lt = new TextBlock();
+                    lt.Text = kv.Key == '[' ? "#" : kv.Key.ToString();
+                    lt.FontSize = 11.5;
+                    lt.Foreground = new SolidColorBrush(Ui.SubCol);
+                    Canvas.SetLeft(lt, x + 1); Canvas.SetTop(lt, y + tH / 2 - 8);
+                    cv.Children.Add(lt);
+                    x += chipW;
+                    foreach (var it in kv.Value)
+                    {
+                        var bd = new Border();
+                        bd.Width = tW; bd.Height = tH;
+                        bd.CornerRadius = new CornerRadius(10);
+                        bd.Background = new SolidColorBrush(Ui.Mix(Ui.CardCol, Ui.BgCol, 0.35));
+                        bd.BorderThickness = new Thickness(1);
+                        bd.BorderBrush = new SolidColorBrush(Ui.LineCol);
+                        var sp = new StackPanel();
+                        sp.VerticalAlignment = VerticalAlignment.Center;
+                        var img = new Image();
+                        double isz = Math.Min(40, tW - 18);
+                        img.Width = isz; img.Height = isz;
+                        img.Source = Icons.Get(it.Path);
+                        RenderOptions.SetBitmapScalingMode(img, BitmapScalingMode.HighQuality);
+                        var nm = new TextBlock();
+                        nm.Text = it.Name;
+                        nm.FontSize = 10.5;
+                        nm.Margin = new Thickness(3, 3, 3, 0);
+                        nm.TextAlignment = TextAlignment.Center;
+                        nm.TextTrimming = TextTrimming.CharacterEllipsis;
+                        nm.Foreground = new SolidColorBrush(Ui.InkCol);
+                        sp.Children.Add(img);
+                        sp.Children.Add(nm);
+                        bd.Child = sp;
+                        bd.Tag = it;
+                        Canvas.SetLeft(bd, x); Canvas.SetTop(bd, y);
+                        cv.Children.Add(bd);
+                        tiles.Add(bd);
+                        tcx.Add(x + tW / 2); tcy.Add(y + tH / 2);
+                        x += tW + gapX;
+                    }
+                    y += tH + gapY;
+                }
+                baseX += colWs[ci] + 18;
+            }
+
+            tipBar = new Border();
+            tipBar.CornerRadius = new CornerRadius(8);
+            tipBar.Background = new SolidColorBrush(Ui.Mix(Ui.LineCol, Ui.BgCol, 0.55));
+            tipBar.Padding = new Thickness(10, 4, 10, 4);
+            tipBar.Visibility = Visibility.Collapsed;
+            tip = new TextBlock();
+            tip.FontSize = 12.5;
+            tip.Foreground = new SolidColorBrush(Ui.InkCol);
+            tipBar.Child = tip;
+            cv.Children.Add(tipBar);
+
+            gear = new Border();
+            gear.Width = 36; gear.Height = 36;
+            gear.CornerRadius = new CornerRadius(9);
+            gear.Background = new SolidColorBrush(Ui.Mix(Ui.CardCol, Ui.BgCol, 0.35));
+            gear.BorderThickness = new Thickness(1);
+            gear.BorderBrush = new SolidColorBrush(Ui.LineCol);
+            var gt = new TextBlock();
+            gt.Text = "\u2699";
+            gt.FontSize = 18;
+            gt.HorizontalAlignment = HorizontalAlignment.Center;
+            gt.VerticalAlignment = VerticalAlignment.Center;
+            gt.Foreground = new SolidColorBrush(Ui.SubCol);
+            gear.Child = gt;
+            Canvas.SetLeft(gear, contentW - 50); Canvas.SetTop(gear, contentH - 50);
+            cv.Children.Add(gear);
+
+            curX = contentW / 2; curY = contentH / 2;
+        }
+
+
+        public void PlaceAt(int sx, int sy, double scale)
+        {
+            winScale = scale;
+            Left = (sx / scale) - contentW / 2;
+            Top = (sy / scale) - contentH / 2;
+            var wa = WF.Screen.FromPoint(new System.Drawing.Point(sx, sy)).WorkingArea;
+            double l = Left * scale, t = Top * scale, w = contentW * scale, h = contentH * scale;
+            if (l < wa.Left + 4) Left = (wa.Left + 4) / scale;
+            if (t < wa.Top + 4) Top = (wa.Top + 4) / scale;
+            if (l + w > wa.Right - 4) Left = (wa.Right - 4 - w) / scale;
+            if (t + h > wa.Bottom - 4) Top = (wa.Bottom - 4 - h) / scale;
+        }
+
+        public bool HitGear(int sx, int sy, double scale)
+        {
+            double x = sx / scale - Left;
+            double y = sy / scale - Top;
+            return x >= contentW - 56 && y >= contentH - 56;
+        }
+
+        void GearHot(bool on)
+        {
+            if (gear == null) return;
+            gear.Background = new SolidColorBrush(on ? Ui.Mix(Ui.CardCol, Ui.AccentCol, 0.30) : Ui.Mix(Ui.CardCol, Ui.BgCol, 0.35));
+            gear.BorderBrush = new SolidColorBrush(on ? Ui.AccentCol : Ui.LineCol);
+        }
+
+        // 键盘/手柄把「设置」齿轮当普通目标选中
+        public void GearSelect()
+        {
+            gearSel = true;
+            GearHot(true);
+            ApplyHit(-1);
+            Hovered = null;
+            tip.Text = "设置";
+            tipBar.Visibility = Visibility.Visible;
+            tipBar.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+            Canvas.SetLeft(tipBar, contentW / 2 - tipBar.DesiredSize.Width / 2);
+            Canvas.SetTop(tipBar, contentH - tipBar.DesiredSize.Height - 48);
+            try { Click.Tick(0); } catch { }
+        }
+
+        public void UpdateHover(int screenX, int screenY, double scale)
+        {
+            if (HitGear(screenX, screenY, scale)) { gearSel = true; GearHot(true); ApplyHit(-1); tip.Text = "设置"; tipBar.Visibility = Visibility.Visible; tipBar.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity)); Canvas.SetLeft(tipBar, contentW / 2 - tipBar.DesiredSize.Width / 2); Canvas.SetTop(tipBar, contentH - tipBar.DesiredSize.Height - 48); return; }
+            gearSel = false;
+            GearHot(false);
+            double x = screenX / scale - Left;
+            double y = screenY / scale - Top;
+            int best = -1; double bd = double.MaxValue;
+            for (int i = 0; i < tiles.Count; i++)
+            {
+                double dx = Math.Abs(x - tcx[i]), dy = Math.Abs(y - tcy[i]);
+                if (dx <= tW / 2 + 6 && dy <= tH / 2 + 6)
+                {
+                    double d = dx + dy;
+                    if (d < bd) { bd = d; best = i; }
+                }
+            }
+            if (best < 0 && clampMode && tiles.Count > 0) { double nb = double.MaxValue; for (int qi = 0; qi < tiles.Count; qi++) { double qx = x - tcx[qi], qy = y - tcy[qi]; double qd = qx * qx + qy * qy; if (qd < nb) { nb = qd; best = qi; } } }
+            ApplyHit(best);
+        }
+
+        int lastIdx = -1;
+        internal bool clampMode;
+        Border gear;
+        void ApplyHit(int idx)
+        {
+            if (idx >= 0) { gearSel = false; GearHot(false); }
+            if (idx == lastIdx) return;
+            lastIdx = idx;
+            for (int i = 0; i < tiles.Count; i++)
+            {
+                tiles[i].Background = new SolidColorBrush(i == idx ? Ui.Mix(Ui.CardCol, Ui.AccentCol, 0.30) : Ui.Mix(Ui.CardCol, Ui.BgCol, 0.35));
+                tiles[i].BorderBrush = new SolidColorBrush(i == idx ? Ui.AccentCol : Ui.LineCol);
+            }
+            if (idx >= 0 && idx < tiles.Count)
+            {
+                Hovered = (AppEntry)tiles[idx].Tag;
+                tip.Text = Hovered.Name;
+                tipBar.Visibility = Visibility.Visible;
+                tipBar.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+                Canvas.SetLeft(tipBar, contentW / 2 - tipBar.DesiredSize.Width / 2);
+                Canvas.SetTop(tipBar, contentH - tipBar.DesiredSize.Height - 6);
+                var c = tcx[idx]; var cyy = tcy[idx];
+                curX = c; curY = cyy;
+                try { Click.Tick(0); } catch { }
+            }
+            else
+            {
+                Hovered = null;
+                tipBar.Visibility = Visibility.Collapsed;
+            }
+        }
+
+        public void HoverItem(AppEntry e) { int i = Items.IndexOf(e); if (i >= 0) ApplyHit(i); }
+
+        public void Move(int dx, int dy)
+        {
+            int cur = Hovered == null ? -1 : Items.IndexOf(Hovered);
+            bool fromGear = gearSel;
+            bool fresh = cur < 0 && !fromGear;
+            double ox, oy;
+            if (fromGear) { ox = contentW - 32; oy = contentH - 32; }
+            else if (cur < 0) { ox = contentW / 2; oy = contentH / 2; }
+            else { ox = tcx[cur]; oy = tcy[cur]; }
+
+
+            double minDot = fresh ? 0.30 : 0.72;
+            double gearDot = fresh ? 0.30 : 0.60;
+            double bs = double.MaxValue; int bi = -1; bool bGear = false;
+
+            for (int pass = 0; pass < 2; pass++)
+            {
+                double md = pass == 0 ? minDot : 0.45;
+                double gd = pass == 0 ? gearDot : 0.40;
+                for (int i = 0; i < Items.Count; i++)
+                {
+                    if (i == cur) continue;
+                    double ux = tcx[i] - ox, uy = tcy[i] - oy;
+                    double l = Math.Sqrt(ux * ux + uy * uy); if (l < 1) continue;
+                    double dot = (ux * dx + uy * dy) / l;
+                    if (dot < md) continue;
+                    double s = fresh ? l / (dot * dot) : l / (dot * dot * dot);
+                    if (s < bs) { bs = s; bi = i; bGear = false; }
+                }
+                if (!fromGear)
+                {
+                    double ux = (contentW - 32) - ox, uy = (contentH - 32) - oy;
+                    double l = Math.Sqrt(ux * ux + uy * uy);
+                    if (l > 1)
+                    {
+                        double dot = (ux * dx + uy * dy) / l;
+                        if (dot >= gd)
+                        {
+                            double s = fresh ? l / (dot * dot) : l / (dot * dot * dot);
+                            if (s < bs) { bs = s; bGear = true; bi = -1; }
+                        }
+                    }
+                }
+                if (bGear || bi >= 0) break;
+            }
+            if (!bGear && bi < 0 && dx > 0 && dy > 0) { GearSelect(); return; }   // 右下方向且无其它候选 -> 选中设置
+
+            if (bGear) { GearSelect(); return; }
+            if (bi >= 0) ApplyHit(bi);
+        }
+
+        public void CursorMove(double nx, double ny)
+        {
+            double mag = Math.Sqrt(nx * nx + ny * ny);
+            if (mag > 1) { nx /= mag; ny /= mag; mag = 1; }
+            double step = 14 + 52 * mag;
+            curX += nx * step; curY += ny * step;
+            clampMode = true;
+            if (tiles.Count > 0)
+            {
+                double mnX = double.MaxValue, mxX = double.MinValue, mnY = double.MaxValue, mxY = double.MinValue;
+                for (int ci = 0; ci < tiles.Count; ci++)
+                {
+                    if (tcx[ci] < mnX) mnX = tcx[ci];
+                    if (tcx[ci] > mxX) mxX = tcx[ci];
+                    if (tcy[ci] < mnY) mnY = tcy[ci];
+                    if (tcy[ci] > mxY) mxY = tcy[ci];
+                }
+                if (curX < mnX) curX = mnX; if (curX > mxX) curX = mxX;
+                if (curY < mnY) curY = mnY; if (curY > mxY) curY = mxY;
+            }
+            else
+            {
+                if (curX < 4) curX = 4; if (curX > contentW - 4) curX = contentW - 4;
+                if (curY < 4) curY = 4; if (curY > contentH - 4) curY = contentH - 4;
+            }
+            UpdateHover((int)Math.Round((Left + curX) * winScale), (int)Math.Round((Top + curY) * winScale), winScale);
+        }
+
+        public AppEntry Commit() { var h = Hovered; Hovered = null; return h; }
+
+        public AppEntry CommitAt(int sx, int sy, double scale) { UpdateHover(sx, sy, scale); return Commit(); }
     }
 
     public static class Launcher
     {
         public static void Run(AppEntry e)
+        {
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate { RunNow(e); });
+        }
+
+        static void RunNow(AppEntry e)
         {
             try
             {
@@ -1078,6 +1870,14 @@ namespace WheelLauncher
 
         [DllImport("user32.dll")]
         public static extern IntPtr GetForegroundWindow();
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public int x; public int y; public uint lPrivate; }
+
+        [DllImport("user32.dll")] public static extern int GetMessage(out MSG msg, IntPtr hWnd, uint min, uint max);
+        [DllImport("user32.dll")] public static extern bool TranslateMessage(ref MSG msg);
+        [DllImport("user32.dll")] public static extern IntPtr DispatchMessage(ref MSG msg);
+        [DllImport("user32.dll")] public static extern bool PostThreadMessage(uint idThread, uint msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
 
         [DllImport("user32.dll")]
         public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
@@ -1134,6 +1934,37 @@ namespace WheelLauncher
             mouse_event(MOUSEEVENTF_XDOWN, 0, 0, data, UIntPtr.Zero);
             mouse_event(MOUSEEVENTF_XUP, 0, 0, data, UIntPtr.Zero);
         }
+        [DllImport("shell32.dll")] public static extern int SHQueryUserNotificationState(out int state);
+        [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out int pid);
+        [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+        [DllImport("kernel32.dll", SetLastError = true)] public static extern bool CloseHandle(IntPtr h);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern bool QueryFullProcessImageName(IntPtr h, int flags, System.Text.StringBuilder name, ref int size);
+        [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern bool Process32First(IntPtr snap, ref PROCESSENTRY32 pe);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern bool Process32Next(IntPtr snap, ref PROCESSENTRY32 pe);
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct PROCESSENTRY32
+        {
+            public uint dwSize;
+            public uint cntUsage;
+            public uint th32ProcessID;
+            public IntPtr th32DefaultHeapID;
+            public uint th32ModuleID;
+            public uint cntThreads;
+            public uint th32ParentProcessID;
+            public int pcPriClassBase;
+            public uint dwFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szExeFile;
+        }
+        [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+        [DllImport("user32.dll")] public static extern IntPtr MonitorFromPoint(POINT pt, uint dwFlags);
+        [DllImport("shcore.dll")] public static extern int GetDpiForMonitor(IntPtr hmon, int dpiType, out uint dpiX, out uint dpiY);        [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+        public const int WM_HOTKEY = 0x0312;
+        public const uint MOD_ALT = 0x0001;
+        public const uint MOD_CONTROL = 0x0002;
+        public const uint MOD_NOREPEAT = 0x4000;
     }
 
     public static class Click
@@ -1469,6 +2300,18 @@ namespace WheelLauncher
             set { Set("autopause", value ? "1" : "0"); }
         }
 
+        public static bool PauseOnStore
+        {
+            get { return GetInt("pausestore", 0) != 0; }
+            set { Set("pausestore", value ? "1" : "0"); }
+        }
+
+        public static bool PauseAccel
+        {
+            get { return GetInt("pauseaccel", 1) != 0; }
+            set { Set("pauseaccel", value ? "1" : "0"); }
+        }
+
         public static bool TabHotkey
         {
             get { return GetInt("tabhotkey", 1) != 0; }
@@ -1513,6 +2356,12 @@ namespace WheelLauncher
             set { Set("release", value.ToString()); }
         }
 
+        public static int WheelStyle
+        {
+            get { return GetInt("wheelstyle", 0); }
+            set { Set("wheelstyle", value == 1 ? "1" : "0"); }
+        }
+
         public static int WheelSize
         {
             get
@@ -1540,9 +2389,25 @@ namespace WheelLauncher
         public static bool ChordUsed = false;
         public static Action<int> Quick;
         public static Action CommitKey;
+        public static Action<int, int> KbMove;
+        static readonly System.Collections.Generic.HashSet<uint> WasdDown = new System.Collections.Generic.HashSet<uint>();
         public static Action ChordRelease;
         public static Func<bool> WheelOpen;
         public static Func<int, int, bool> LeftClick;
+        public static Action<int> PageFlip;      // 滚轮 / 方括号 / 肩键翻页
+        public static Action<int> HotkeyFire;
+        public static System.Windows.Threading.Dispatcher UiDispatcher;
+        static volatile bool wheelShown;
+        static int wl, wt, wr, wb;
+        System.Threading.Thread pump;
+        volatile bool wantKeyboard;
+        uint pumpTid;
+        const uint WM_APP_APPLY_KEYS = 0x8001;
+
+        public static void SetWheelRect(bool shown, int l, int t, int r, int b)
+        {
+            wl = l; wt = t; wr = r; wb = b; wheelShown = shown;
+        }
         int _mvCount = 0;
 
         Native.HookProc mouseProc, keyProc;
@@ -1556,14 +2421,21 @@ namespace WheelLauncher
 
         public void SetKeyboard(bool on)
         {
+            wantKeyboard = on;
+            try { if (pumpTid != 0) Native.PostThreadMessage(pumpTid, WM_APP_APPLY_KEYS, IntPtr.Zero, IntPtr.Zero); } catch { }
+        }
+
+        void ApplyKeyboard()
+        {
             try
             {
-                if (on && keyHook == IntPtr.Zero)
+                IntPtr mod = Native.GetModuleHandle(null);
+                if (wantKeyboard && keyHook == IntPtr.Zero)
                 {
-                    keyHook = Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, keyProc, Native.GetModuleHandle(null), 0);
+                    keyHook = Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, keyProc, mod, 0);
                     Log.W("keyboard hook on=" + keyHook);
                 }
-                else if (!on && keyHook != IntPtr.Zero)
+                else if (!wantKeyboard && keyHook != IntPtr.Zero)
                 {
                     Native.UnhookWindowsHookEx(keyHook);
                     keyHook = IntPtr.Zero;
@@ -1573,25 +2445,48 @@ namespace WheelLauncher
             catch (Exception ex) { Log.W("keyboard hook failed: " + ex.Message); }
         }
 
-        public void Install(bool keyboardHotkey)
+        void PumpLoop()
         {
             mouseProc = MouseCallback;
             keyProc = KeyCallback;
             IntPtr mod = Native.GetModuleHandle(null);
+            pumpTid = Native.GetCurrentThreadId();
             mouseHook = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, mouseProc, mod, 0);
             if (mouseHook == IntPtr.Zero)
             {
                 System.Threading.Thread.Sleep(300);
                 mouseHook = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, mouseProc, mod, 0);
             }
-            if (keyboardHotkey) keyHook = Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, keyProc, mod, 0);
-            if (keyboardHotkey && keyHook == IntPtr.Zero)
+            if (wantKeyboard) keyHook = Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, keyProc, mod, 0);
+            Log.W("hooks installed on pump thread mouse=" + mouseHook + " key=" + keyHook);
+            if (mouseHook == IntPtr.Zero) Log.W("HOOK INSTALL FAILED - side button will not work");
+            while (true)
             {
-                System.Threading.Thread.Sleep(300);
-                keyHook = Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, keyProc, mod, 0);
+                Native.MSG m;
+                int r = Native.GetMessage(out m, IntPtr.Zero, 0, 0);
+                if (r == 0 || r == -1) break;
+                if (m.message == WM_APP_APPLY_KEYS) { ApplyKeyboard(); continue; }
+                Native.TranslateMessage(ref m);
+                Native.DispatchMessage(ref m);
             }
-            Log.W("hooks installed mouse=" + mouseHook + " key=" + keyHook);
+            Log.W("pump loop exited");
         }
+
+        public void Start(bool keyboardHotkey)
+        {
+            wantKeyboard = keyboardHotkey;
+            if (pump != null) { SetKeyboard(keyboardHotkey); return; }
+            pump = new System.Threading.Thread(PumpLoop);
+            pump.IsBackground = true;
+            pump.Start();
+            for (int i = 0; i < 120 && mouseHook == IntPtr.Zero; i++) System.Threading.Thread.Sleep(20);
+        }
+
+        public void Install(bool keyboardHotkey)
+        {
+            Start(keyboardHotkey);
+        }
+
 
         IntPtr MouseCallback(int nCode, IntPtr wParam, IntPtr lParam)
         {
@@ -1604,9 +2499,18 @@ namespace WheelLauncher
                     if (AcceptInjected || (info.flags & Native.LLMHF_INJECTED) == 0)
                     {
                         int msg = wParam.ToInt32();
-                        if (msg == 0x0201 && LeftClick != null)
+                        if (msg == 0x020A && wheelShown && PageFlip != null && info.pt.x >= wl && info.pt.x <= wr && info.pt.y >= wt && info.pt.y <= wb)
                         {
-                            try { if (LeftClick(info.pt.x, info.pt.y)) return (IntPtr)1; } catch { }
+                            int wd = (short)((info.mouseData >> 16) & 0xFFFF);
+                            int dir = wd > 0 ? 1 : -1;
+                            System.Windows.Application.Current.Dispatcher.BeginInvoke(new Action(delegate { var pf = PageFlip; if (pf != null) { try { pf(dir); } catch { } } }));
+                            return (IntPtr)1;
+                        }
+                        if (msg == 0x0201 && LeftClick != null && wheelShown && info.pt.x >= wl && info.pt.x <= wr && info.pt.y >= wt && info.pt.y <= wb)
+                        {
+                            int lx = info.pt.x, ly = info.pt.y;
+                            System.Windows.Application.Current.Dispatcher.BeginInvoke(new Action(delegate { try { LeftClick(lx, ly); } catch { } }));
+                            return (IntPtr)1;
                         }
                         if (msg == Native.WM_XBUTTONDOWN)
                         {
@@ -1647,6 +2551,20 @@ namespace WheelLauncher
                     if (AcceptInjected || !injected)
                     {
                         uint vk = k.vkCode;
+                        if ((vk == 0x41 || vk == 0x42)
+                            && (Native.GetAsyncKeyState(0x11) & 0x8000) != 0
+                            && (Native.GetAsyncKeyState(0x12) & 0x8000) != 0
+                            && (Native.GetAsyncKeyState(0x10) & 0x8000) == 0)
+                        {
+                            var hf = HotkeyFire;
+                            if (hf != null)
+                            {
+                                int which = vk == 0x41 ? 1 : 2;
+                                Log.W("hotkey hook ctrl+alt+" + ((char)vk));
+                                UiDispatcher.BeginInvoke(new Action(delegate { try { hf(which); } catch (Exception ex) { Log.W("hook hotkey failed: " + ex.Message); } }));
+                                return (IntPtr)1;
+                            }
+                        }
                         bool open = WheelOpen != null && WheelOpen();
                         if (vk == 0x09)
                         {
@@ -1669,6 +2587,29 @@ namespace WheelLauncher
                             TabDown = true;
                             ChordFired = false;
                             ChordUsed = false;
+                            return (IntPtr)1;
+                        }
+                        else if (open && (vk == 0x57 || vk == 0x53 || vk == 0x44 || vk == 0x41))
+                        {
+                            WasdDown.Add(vk);
+                            int ndx = 0, ndy = 0;
+                            if (WasdDown.Contains(0x44)) ndx += 1;
+                            if (WasdDown.Contains(0x41)) ndx -= 1;
+                            if (WasdDown.Contains(0x53)) ndy += 1;
+                            if (WasdDown.Contains(0x57)) ndy -= 1;
+                            System.Windows.Application.Current.Dispatcher.BeginInvoke(new Action(delegate { var kb = KbMove; if (kb != null) kb(ndx, ndy); }));
+                            return (IntPtr)1;
+                        }
+                        else if (open && vk == 0x42)
+                        {
+                            // 方格/圆形面板通用：B 键取消
+                            System.Windows.Application.Current.Dispatcher.BeginInvoke(new Action(() => { var h = Escape; if (h != null) h(); }));
+                            return (IntPtr)1;
+                        }
+                        else if (open && (vk == 0xDB || vk == 0xDD))
+                        {
+                            int d3 = vk == 0xDD ? 1 : -1;
+                            System.Windows.Application.Current.Dispatcher.BeginInvoke(new Action(delegate { var pf = PageFlip; if (pf != null) { try { pf(d3); } catch { } } }));
                             return (IntPtr)1;
                         }
                         else if (vk == Native.VK_ESCAPE)
@@ -1697,6 +2638,7 @@ namespace WheelLauncher
                 else if (nCode >= 0 && msg == 0x0101)
                 {
                     var k2 = (Native.KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.KBDLLHOOKSTRUCT));
+                    WasdDown.Remove(k2.vkCode);
                     if ((k2.vkCode == 0x41 || k2.vkCode == 0x42) && ChordFired)
                     {
                         // 松开 A/B 就相当于「松手」：启动当前悬停的应用
@@ -1814,7 +2756,47 @@ namespace WheelLauncher
         TextBlock centerText;
         TextBlock subText;
         public double cx, cy;
-        public double hubRadius; double winScale = 1; Ellipse hubHotRing; public double WinScale { get { return winScale; } }
+        public double hubRadius; double winScale = 1; Ellipse hubHotRing;         public bool HubSelected { get; private set; }
+        public double AngleDegRing(Ring ring, int idx)
+        {
+            double a = -90 + RingOffset(ring.Index) * 180.0 / Math.PI + 360.0 * idx / ring.Capacity;
+            a = a % 360; if (a < 0) a += 360;
+            return a;
+        }
+        public bool TryPos(AppEntry hit, out double px, out double py)
+        {
+            px = 0; py = 0;
+            if (hit == null) return false;
+            for (int i = 0; i < rings.Count; i++)
+            {
+                int idx = rings[i].Items.IndexOf(hit);
+                if (idx < 0) continue;
+                double a = -Math.PI / 2 + RingOffset(rings[i].Index) + 2 * Math.PI * idx / rings[i].Capacity;
+                px = rings[i].Radius * Math.Cos(a);
+                py = rings[i].Radius * Math.Sin(a);
+                return true;
+            }
+            return false;
+        }
+        public void HoverItem(AppEntry hit)
+        {
+            double px, py;
+            if (!TryPos(hit, out px, out py)) return;
+            UpdateHover((int)Math.Round((Left + cx + px) * winScale), (int)Math.Round((Top + cy + py) * winScale), winScale);
+        }
+
+        // 键盘/手柄把中心「设置」选中
+        public void HoverHub()
+        {
+            UpdateHover((int)Math.Round((Left + cx) * winScale), (int)Math.Round((Top + cy) * winScale), winScale);
+        }
+        public List<AppEntry> AllItems()
+        {
+            var list = new List<AppEntry>();
+            foreach (var ring in rings) list.AddRange(ring.Items);
+            return list;
+        }public double WinScale { get { return winScale; } }
+        public double MaxRadius { get { double m = 0; foreach (var r in rings) if (r.Radius > m) m = r.Radius; return m + iconSize * 0.6; } }
         Border bottomBar;
         TextBlock bottomText;
         List<Ring> rings = new List<Ring>();
@@ -1851,7 +2833,7 @@ namespace WheelLauncher
             catch { }
         }
 
-        public void SetLayout(List<Ring> layout, double icon, double hubR, double r0v, string hintText)
+        public void SetLayout(List<Ring> layout, double icon, double hubR, double r0v, string hintText, string tipText = null)
         {
             rings = layout; iconSize = icon; spacing = 0; hubRadius = hubR;
             double maxR = r0v;
@@ -2066,7 +3048,7 @@ namespace WheelLauncher
             {
                 var tip = new TextBlock
                 {
-                    Text = "Esc 取消 · 空白处松手不启动 · Tab+A / Tab+B 呼出",
+                    Text = tipText ?? "Esc 取消 · 空白处松手不启动 · Tab+A / Tab+B 呼出",
                     Foreground = new SolidColorBrush(WheelSkin.H(228)),
                     FontSize = 11.5
                 };
@@ -2095,6 +3077,7 @@ namespace WheelLauncher
             Log.W("place sx=" + screenX + " sy=" + screenY + " scale=" + scale + " wpx=" + w + " leftDIP=" + Left + " topDIP=" + Top);
         }
 
+
         public void UpdateHover(int screenX, int screenY, double scale)
         {
             double x = (screenX / scale) - Left - cx;
@@ -2108,6 +3091,7 @@ namespace WheelLauncher
                 centerText.FontSize = Math.Max(20, hubRadius * 0.66);
                 centerText.Foreground = new SolidColorBrush(WheelSkin.H(255));
                 if (hubHotRing != null) hubHotRing.Visibility = Visibility.Visible;
+                HubSelected = true;
                 Canvas.SetTop(centerText, cy - centerText.FontSize * 0.62);
                 bottomText.Text = "圆盘设置";
                 bottomBar.Visibility = Visibility.Visible;
@@ -2139,6 +3123,7 @@ namespace WheelLauncher
             if (hit != hovered)
             {
                 hovered = hit;
+                HubSelected = false;
                 if (hit != null) { Click.Tick(ringIdx); lastHit = hit; lastHitAt = DateTime.Now; }
                 if (hubHotRing != null) hubHotRing.Visibility = Visibility.Collapsed;
                 if (hit != null)
@@ -2310,86 +3295,166 @@ namespace WheelLauncher
 
         public WheelSettingsWindow(int startTab)
         {
-            Title = "圆盘设置";
-            Width = 1000; Height = 700;
+            Title = "轮盘启动器 · 设置";
+            Width = 980; Height = 700; MinWidth = 880; MinHeight = 620;
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
+            Ui.Crisp(this);
+            BuildUi(startTab);
+            // 列表刷新放到 BuildUi 末尾（切主题重建界面时也要刷新）
+        }
+
+        void BuildUi(int startPage)
+        {
             Background = new SolidColorBrush(Ui.BgCol);
             Foreground = new SolidColorBrush(Ui.InkCol);
             FontSize = 13;
 
             var root = new Grid { Background = new SolidColorBrush(Ui.BgCol) };
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            Content = root;
-            Ui.Crisp(this);
+            root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(212) });
+            root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
-            // 顶部标题 + 右上角主题切换
-            var head = new DockPanel { Margin = new Thickness(20, 16, 20, 2), LastChildFill = true };
-            var bTheme = Ui.MkButton(Ui.Dark ? "☀  浅色界面" : "☾  深色界面", false);
-            bTheme.Margin = new Thickness(10, 2, 0, 0);
-            bTheme.Padding = new Thickness(16, 7, 16, 7);
-            bTheme.VerticalAlignment = VerticalAlignment.Top;
-            bTheme.Click += delegate
+            var side = new Border
             {
-                Settings.DarkUI = !Settings.DarkUI;
-                Reopen = true;
-                Close();
+                Background = new SolidColorBrush(Ui.CardCol),
+                BorderBrush = new SolidColorBrush(Ui.LineCol),
+                BorderThickness = new Thickness(0, 0, 1, 0)
             };
-            DockPanel.SetDock(bTheme, Dock.Right);
-            head.Children.Add(bTheme);
+            var sideDock = new DockPanel { Margin = new Thickness(14, 22, 14, 16) };
+            side.Child = sideDock;
 
-            var titleBox = new StackPanel();
-            titleBox.Children.Add(new TextBlock { Text = "圆盘设置", FontSize = 21, FontWeight = FontWeights.SemiBold });
-            titleBox.Children.Add(new TextBlock
+            var brand = new StackPanel { Margin = new Thickness(6, 0, 6, 26) };
+            brand.Children.Add(new TextBlock { Text = "轮盘启动器", FontSize = 16.5, FontWeight = FontWeights.SemiBold });
+            brand.Children.Add(new TextBlock { Text = "WHEEL LAUNCHER", FontSize = 9.5, Foreground = new SolidColorBrush(Ui.MutedCol), Margin = new Thickness(0, 4, 0, 0) });
+            DockPanel.SetDock(brand, Dock.Top);
+            sideDock.Children.Add(brand);
+
+            var nav = new StackPanel();
+            DockPanel.SetDock(nav, Dock.Top);
+            sideDock.Children.Add(nav);
+
+            var pageWheel = PageHost("圆盘内容", "圆盘上出现什么，顺序按首字母自动排。", BuildWheelPage());
+            var pageGame = PageHost("游戏与暂停", "什么时候自动让开，不打扰你玩。", BuildGamePage());
+            var pageLook = PageHost("外观与行为", "配色、大小、松手之后做什么。", BuildLookPage());
+
+            var host = new Grid();
+            var pages = new FrameworkElement[] { pageWheel, pageGame, pageLook };
+            foreach (var pg in pages) host.Children.Add(pg);
+
+            var navButtons = new List<Button>();
+            string[] navText = { "圆盘内容", "游戏与暂停", "外观与行为" };
+            for (int i = 0; i < 3; i++)
             {
-                Text = "有什么 · 什么时候让开 · 长什么样",
-                FontSize = 12,
-                Foreground = new SolidColorBrush(Ui.SubCol),
-                Margin = new Thickness(0, 3, 0, 0)
-            });
-            head.Children.Add(titleBox);
-            DockPanel.SetDock(head, Dock.Top);
-            Grid.SetRow(head, 0);
-            root.Children.Add(head);
+                int idx = i;
+                var nb = Ui.MkButton(navText[i], false);
+                nb.Height = 38;
+                nb.Margin = new Thickness(0, 0, 0, 4);
+                nb.Padding = new Thickness(14, 0, 14, 0);
+                nb.HorizontalContentAlignment = HorizontalAlignment.Left;
+                nb.FontSize = 13.5;
+                nb.Click += delegate { ShowPage(idx); };
+                navButtons.Add(nb);
+                nav.Children.Add(nb);
+            }
 
-            tabs = new TabControl { Margin = new Thickness(16, 12, 16, 6), Background = new SolidColorBrush(Ui.BgCol), BorderThickness = new Thickness(0) };
-            tabs.Items.Add(BuildWheelTab());
-            tabs.Items.Add(BuildGameTab());
-            tabs.Items.Add(BuildLookTab());
-            Ui.SkinTabs(tabs);
-            if (startTab > 0) tabs.SelectedIndex = startTab;
-            Grid.SetRow(tabs, 1);
-            root.Children.Add(tabs);
+            foreach (var nbx in navButtons) { nbx.MouseLeave += delegate { if (showPage != null) showPage(curIdx); }; }
 
-            var foot = new DockPanel { Margin = new Thickness(20, 4, 20, 14) };
+            var bTheme = Ui.MkButton(Ui.Dark ? "切换到浅色界面" : "切换到深色界面", false);
+            bTheme.Height = 36;
+            bTheme.Margin = new Thickness(0, 22, 0, 0);
+            bTheme.HorizontalContentAlignment = HorizontalAlignment.Left;
+            bTheme.Padding = new Thickness(14, 0, 14, 0);
+            bTheme.Click += delegate { Settings.DarkUI = !Settings.DarkUI; BuildUi(curIdx); };
+            nav.Children.Add(bTheme);
+
+            var ver = new TextBlock
+            {
+                Text = "本地版本 · Wheel Launcher",
+                FontSize = 10.5,
+                Foreground = new SolidColorBrush(Ui.MutedCol),
+                Margin = new Thickness(6, 14, 6, 2)
+            };
+            nav.Children.Add(ver);
+
+            Grid.SetColumn(side, 0);
+            root.Children.Add(side);
+
+            var right = new DockPanel { LastChildFill = true };
+            var foot = new DockPanel { Margin = new Thickness(28, 8, 24, 16) };
             var hint = new TextBlock
             {
-                Text = "改动即时生效，关掉窗口就行 · 数据保存在 %APPDATA%\\WheelLauncher",
+                Text = "改动即时生效 · 配置保存在 %APPDATA%\\WheelLauncher",
                 FontSize = 11.5,
                 VerticalAlignment = VerticalAlignment.Center,
-                Foreground = new SolidColorBrush(Ui.SubCol)
+                Foreground = new SolidColorBrush(Ui.MutedCol)
             };
-            var bClose = Ui.MkButton("关闭", true);
-            bClose.HorizontalAlignment = HorizontalAlignment.Right;
+            var bClose = Ui.MkButton("关闭", false);
+            bClose.MinWidth = 92; bClose.Height = 34;
             bClose.VerticalAlignment = VerticalAlignment.Center;
-            bClose.Margin = new Thickness(10, 0, 0, 0);
+            bClose.Margin = new Thickness(12, 0, 0, 0);
             bClose.Click += delegate { Close(); };
             DockPanel.SetDock(bClose, Dock.Right);
-            foot.Children.Add(hint);
             foot.Children.Add(bClose);
+            foot.Children.Add(hint);
             DockPanel.SetDock(foot, Dock.Bottom);
-            Grid.SetRow(foot, 2);
-            root.Children.Add(foot);
+            right.Children.Add(foot);
+            right.Children.Add(host);
+            Grid.SetColumn(right, 1);
+            root.Children.Add(right);
+            Content = root;
 
-            Ui.Crisp(this);
-            Loaded += delegate { ReloadWheel(); ReloadGames(); };
+            showPage = delegate (int i)
+            {
+                curIdx = i;
+                for (int k = 0; k < pages.Length; k++)
+                    pages[k].Visibility = (k == i) ? Visibility.Visible : Visibility.Collapsed;
+                for (int k = 0; k < navButtons.Count; k++)
+                {
+                    bool sel = (k == i);
+                    var b = navButtons[k];
+                    b.Background = new SolidColorBrush(sel ? Ui.SelBgCol : Ui.CardCol);
+                    b.Foreground = new SolidColorBrush(sel ? Ui.InkCol : Ui.SubCol);
+                    b.FontWeight = sel ? FontWeights.SemiBold : FontWeights.Normal;
+                }
+            };
+            ShowPage(startPage < 0 || startPage > 2 ? 0 : startPage);
+Dispatcher.BeginInvoke(new Action(delegate
+            {
+                ReloadWheel();
+                ReloadGames();
+            }), System.Windows.Threading.DispatcherPriority.Loaded);
+        }
+        Action<int> showPage;
+        int curIdx;
+
+        public void ShowPage(int i)
+        {
+            if (showPage != null) showPage(i);
+        }
+
+        FrameworkElement PageHost(string title, string desc, FrameworkElement body)
+        {
+            var d = new DockPanel { LastChildFill = true };
+            var hd = new StackPanel { Margin = new Thickness(26, 20, 26, 12) };
+            hd.Children.Add(new TextBlock { Text = title, FontSize = 19.5, FontWeight = FontWeights.SemiBold, Foreground = new SolidColorBrush(Ui.InkCol) });
+            hd.Children.Add(new TextBlock { Text = desc, FontSize = 12.5, Foreground = new SolidColorBrush(Ui.SubCol), Margin = new Thickness(0, 5, 0, 0) });
+            DockPanel.SetDock(hd, Dock.Top);
+            var card = new Border
+            {
+                Margin = new Thickness(24, 0, 24, 14),
+                Background = new SolidColorBrush(Ui.CardCol),
+                BorderBrush = new SolidColorBrush(Ui.LineCol),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(10),
+                Child = body
+            };
+            d.Children.Add(hd);
+            d.Children.Add(card);
+            return d;
         }
 
         // ================= 圆盘外观 =================
-        TabItem BuildLookTab()
+        FrameworkElement BuildLookPage()
         {
-            var tab = new TabItem { Header = "  圆盘外观  ", Padding = new Thickness(4, 2, 4, 2) };
             var panel = new StackPanel { Margin = new Thickness(22, 18, 22, 10) };
 
             panel.Children.Add(new TextBlock { Text = "轮盘配色", FontSize = 14, FontWeight = FontWeights.SemiBold, Foreground = new SolidColorBrush(Ui.InkCol), Margin = new Thickness(0, 0, 0, 4) });
@@ -2492,18 +3557,37 @@ namespace WheelLauncher
             panel.Children.Add(rbRelease);
             panel.Children.Add(rbClick);
 
-            tab.Content = panel;
-            return tab;
+            var sep2 = new Border(); sep2.Height = 1; sep2.Margin = new Thickness(0, 14, 0, 14);
+            sep2.Background = new SolidColorBrush(Ui.LineCol);
+            panel.Children.Add(sep2);
+            var lblStyle = new TextBlock();
+            lblStyle.Text = "轮盘样式";
+            lblStyle.FontSize = 13; lblStyle.Margin = new Thickness(0, 0, 0, 8);
+            lblStyle.Foreground = new SolidColorBrush(Ui.InkCol);
+            panel.Children.Add(lblStyle);
+            var rbRound = Ui.MkRadio("圆形轮盘（按字母成环，看着更漂亮）", "wheelstyle", Settings.WheelStyle == 0);
+            rbRound.Margin = new Thickness(0, 0, 0, 10);
+            rbRound.Checked += delegate { if (rbRound.IsChecked == true) { Settings.WheelStyle = 0; Changed = true; } };
+            panel.Children.Add(rbRound);
+            var rbGrid = Ui.MkRadio("方格面板（按字母分行，标注更清楚、更容易点）", "wheelstyle", Settings.WheelStyle == 1);
+            rbGrid.Checked += delegate { if (rbGrid.IsChecked == true) { Settings.WheelStyle = 1; Changed = true; } };
+            panel.Children.Add(rbGrid);
+            panel.Children.Add(new Border { Height = 1, Background = new SolidColorBrush(Ui.LineCol), Margin = new Thickness(0, 20, 0, 18) });
+            var bMore = Ui.MkButton("长按时间与音效…", false);
+            bMore.HorizontalAlignment = HorizontalAlignment.Left;
+            bMore.Click += delegate { var wa = Application.Current as WheelApp; if (wa != null) wa.OpenSettings(); };
+            panel.Children.Add(bMore);
+            return panel;
         }
-
-        TabItem BuildWheelTab()
+        FrameworkElement BuildWheelPage()
         {
-            var tab = new TabItem { Header = "  显示到轮盘  ", Padding = new Thickness(4, 2, 4, 2) };
             var panel = new DockPanel();
-            tab.Content = panel;
 
-            var bar = new DockPanel { Margin = new Thickness(12, 12, 12, 10) };
-            var left = new StackPanel { Orientation = Orientation.Horizontal };
+            var bar = new Grid { Margin = new Thickness(12, 12, 12, 10) };
+            bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            var left = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
             var bAuto = Ui.MkButton("自动收录文件夹…", true);
             bAuto.Margin = new Thickness(0, 0, 8, 0);
             var bFile = Ui.MkButton("添加文件…", false);
@@ -2517,24 +3601,42 @@ namespace WheelLauncher
 
             tbSearch = new TextBox
             {
-                Width = 220,
-                Padding = new Thickness(8, 5, 8, 5),
+                Width = 166,
+                Padding = new Thickness(0),
+                BorderThickness = new Thickness(0),
                 VerticalContentAlignment = VerticalAlignment.Center,
-                Background = new SolidColorBrush(Ui.HeadCol),
+                Background = Brushes.Transparent,
                 Foreground = new SolidColorBrush(Ui.InkCol),
-                BorderBrush = new SolidColorBrush(Ui.LineCol),
+                FontSize = 12.5,
                 ToolTip = "按名称或路径筛选"
             };
-            var searchWrap = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Center };
-            searchWrap.Children.Add(new TextBlock { Text = "搜索", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 6, 0), Foreground = new SolidColorBrush(Ui.SubCol), FontSize = 12 });
-            searchWrap.Children.Add(tbSearch);
+            var searchWrap = new Border
+            {
+                Background = new SolidColorBrush(Ui.ChipCol),
+                BorderBrush = new SolidColorBrush(Ui.LineCol),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(8),
+                Height = 32,
+                Width = 218,
+                Padding = new Thickness(10, 0, 8, 0),
+                VerticalAlignment = VerticalAlignment.Center,
+                HorizontalAlignment = HorizontalAlignment.Right
+            };
+            var searchInner = new DockPanel { LastChildFill = true };
+            var mag = new TextBlock { Text = "\u2315", FontSize = 15, Foreground = new SolidColorBrush(Ui.MutedCol), VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 8, 0) };
+            DockPanel.SetDock(mag, Dock.Left);
+            searchInner.Children.Add(mag);
+            searchInner.Children.Add(tbSearch);
+            searchWrap.Child = searchInner;
             DockPanel.SetDock(searchWrap, Dock.Right);
+            Grid.SetColumn(searchWrap, 2);
             bar.Children.Add(searchWrap);
+            Grid.SetColumn(left, 0);
             bar.Children.Add(left);
             DockPanel.SetDock(bar, Dock.Top);
             panel.Children.Add(bar);
 
-            var footRow = new DockPanel { Margin = new Thickness(12, 4, 12, 12) };
+            var footRow = new DockPanel { Margin = new Thickness(12, 8, 12, 12) };
             var cbAuto = new CheckBox
             {
                 Content = "启动时自动收录常用文件夹（文档 / 下载）",
@@ -2553,14 +3655,26 @@ namespace WheelLauncher
             DockPanel.SetDock(footRow, Dock.Bottom);
             panel.Children.Add(footRow);
 
-            lvWheel = new ListView { Margin = new Thickness(12, 0, 12, 0), Background = new SolidColorBrush(Ui.CardCol), BorderThickness = new Thickness(0), FontSize = 12.5 };
+            lvWheel = new ListView { Margin = new Thickness(12, 0, 12, 0), Background = new SolidColorBrush(Ui.CardCol), BorderThickness = new Thickness(0), FontSize = 12.5, Padding = new Thickness(2, 2, 2, 2) };
+            ScrollViewer.SetHorizontalScrollBarVisibility(lvWheel, ScrollBarVisibility.Auto);
             var gv = new GridView();
-            gv.Columns.Add(new GridViewColumn { Header = "名称", Width = 280, DisplayMemberBinding = new System.Windows.Data.Binding("Name") });
-            gv.Columns.Add(new GridViewColumn { Header = "类型", Width = 80, DisplayMemberBinding = new System.Windows.Data.Binding("Kind") });
-            gv.Columns.Add(new GridViewColumn { Header = "来源", Width = 120, DisplayMemberBinding = new System.Windows.Data.Binding("Source") });
-            gv.Columns.Add(new GridViewColumn { Header = "路径", Width = 450, DisplayMemberBinding = new System.Windows.Data.Binding("Path") });
+            gv.Columns.Add(new GridViewColumn { Header = "名称", Width = 218, DisplayMemberBinding = new System.Windows.Data.Binding("Name") });
+            gv.Columns.Add(new GridViewColumn { Header = "类型", Width = 58, DisplayMemberBinding = new System.Windows.Data.Binding("Kind") });
+            gv.Columns.Add(new GridViewColumn { Header = "来源", Width = 96, DisplayMemberBinding = new System.Windows.Data.Binding("Source") });
+            var pathCol = new GridViewColumn { Header = "路径", Width = 470 };
+            var ptpl = new DataTemplate();
+            var pfef = new FrameworkElementFactory(typeof(TextBlock));
+            pfef.SetValue(TextBlock.TextProperty, new System.Windows.Data.Binding("Path"));
+            pfef.SetValue(FrameworkElement.ToolTipProperty, new System.Windows.Data.Binding("Path"));
+            pfef.SetValue(TextBlock.TextTrimmingProperty, TextTrimming.CharacterEllipsis);
+            pfef.SetValue(FrameworkElement.MarginProperty, new Thickness(0, 0, 10, 0));
+            pfef.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
+            ptpl.VisualTree = pfef;
+            pathCol.CellTemplate = ptpl;
+            gv.Columns.Add(pathCol);
             lvWheel.View = gv;
             Ui.Skin(lvWheel, gv);
+            lvWheel.BorderThickness = new Thickness(0);
 
             emptyWheel = new TextBlock
             {
@@ -2575,6 +3689,16 @@ namespace WheelLauncher
             };
             var gridW = new Grid();
             gridW.Children.Add(lvWheel);
+var cornerPatch = new System.Windows.Shapes.Rectangle
+            {
+                Width = 44, Height = 44,
+                Fill = new SolidColorBrush(Ui.CardCol),
+                HorizontalAlignment = HorizontalAlignment.Right,
+                VerticalAlignment = VerticalAlignment.Bottom,
+                Margin = new Thickness(0, 0, 0, 0),
+                IsHitTestVisible = false
+            };
+            gridW.Children.Add(cornerPatch);
             gridW.Children.Add(emptyWheel);
             panel.Children.Add(gridW);
 
@@ -2589,7 +3713,7 @@ namespace WheelLauncher
                 w.ShowDialog();
                 if (w.Added > 0) { Changed = true; ReloadWheel(); Notify(); }
             };
-            return tab;
+            return panel;
         }
 
         public void ReloadWheel()
@@ -2668,11 +3792,9 @@ namespace WheelLauncher
         }
 
         // ================= 游戏（自动暂停） =================
-        TabItem BuildGameTab()
+        FrameworkElement BuildGamePage()
         {
-            var tab = new TabItem { Header = "  游戏自动暂停  ", Padding = new Thickness(4, 2, 4, 2) };
             var panel = new DockPanel();
-            tab.Content = panel;
 
             var bar = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(12, 12, 12, 10) };
             var bDir = Ui.MkButton("添加游戏文件夹…", true);
@@ -2684,7 +3806,8 @@ namespace WheelLauncher
             DockPanel.SetDock(bar, Dock.Top);
             panel.Children.Add(bar);
 
-            var footRow = new DockPanel { Margin = new Thickness(12, 4, 12, 12) };
+            var footRow = new StackPanel { Margin = new Thickness(12, 8, 12, 10) };
+            var cbRow = new WrapPanel();
             var cbPause = new CheckBox
             {
                 Content = "检测到游戏时自动暂停轮盘（侧键与 Tab 快捷键全部放行）",
@@ -2696,20 +3819,61 @@ namespace WheelLauncher
             Ui.StyleCheck(cbPause);
             cbPause.Checked += delegate { Settings.AutoPause = true; ReloadGames(); };
             cbPause.Unchecked += delegate { Settings.AutoPause = false; ReloadGames(); };
-            tipGame = new TextBlock { FontSize = 11.5, VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Right, Foreground = new SolidColorBrush(Ui.SubCol) };
-            DockPanel.SetDock(tipGame, Dock.Right);
+            var cbStore = new CheckBox
+            {
+                Content = "打开 Steam / Epic 等游戏平台窗口时也暂停",
+                IsChecked = Settings.PauseOnStore,
+                Foreground = new SolidColorBrush(Ui.InkCol),
+                FontSize = 12,
+                Margin = new Thickness(18, 0, 0, 0),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            Ui.StyleCheck(cbStore);
+            cbStore.Checked += delegate { Settings.PauseOnStore = true; ReloadGames(); };
+            cbStore.Unchecked += delegate { Settings.PauseOnStore = false; ReloadGames(); };
+            var cbAccel = new CheckBox
+            {
+                Content = "加速器窗口在前台时也放行（biubiu 等）",
+                IsChecked = Settings.PauseAccel,
+                Foreground = new SolidColorBrush(Ui.InkCol),
+                FontSize = 12,
+                Margin = new Thickness(18, 0, 0, 0),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            Ui.StyleCheck(cbAccel);
+            cbAccel.Checked += delegate { Settings.PauseAccel = true; };
+            cbAccel.Unchecked += delegate { Settings.PauseAccel = false; };
+            tipGame = new TextBlock { FontSize = 11.5, VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Left, Foreground = new SolidColorBrush(Ui.SubCol), Margin = new Thickness(2, 7, 0, 0) };
+            cbPause.Margin = new Thickness(0, 4, 24, 0);
+            cbStore.Margin = new Thickness(0, 4, 24, 0);
+            cbAccel.Margin = new Thickness(0, 4, 24, 0);
+            cbRow.Children.Add(cbPause);
+            cbRow.Children.Add(cbStore);
+            cbRow.Children.Add(cbAccel);
+            footRow.Children.Add(cbRow);
             footRow.Children.Add(tipGame);
-            footRow.Children.Add(cbPause);
             DockPanel.SetDock(footRow, Dock.Bottom);
             panel.Children.Add(footRow);
 
-            lvGame = new ListView { Margin = new Thickness(12, 0, 12, 0), Background = new SolidColorBrush(Ui.CardCol), BorderThickness = new Thickness(0), FontSize = 12.5 };
+            lvGame = new ListView { Margin = new Thickness(12, 0, 12, 0), Background = new SolidColorBrush(Ui.CardCol), BorderThickness = new Thickness(0), FontSize = 12.5, Padding = new Thickness(2, 2, 2, 2) };
+            ScrollViewer.SetHorizontalScrollBarVisibility(lvGame, ScrollBarVisibility.Auto);
             var gv = new GridView();
-            gv.Columns.Add(new GridViewColumn { Header = "名称", Width = 280, DisplayMemberBinding = new System.Windows.Data.Binding("Name") });
-            gv.Columns.Add(new GridViewColumn { Header = "判定方式", Width = 160, DisplayMemberBinding = new System.Windows.Data.Binding("Source") });
-            gv.Columns.Add(new GridViewColumn { Header = "路径", Width = 490, DisplayMemberBinding = new System.Windows.Data.Binding("Path") });
+            gv.Columns.Add(new GridViewColumn { Header = "名称", Width = 218, DisplayMemberBinding = new System.Windows.Data.Binding("Name") });
+            gv.Columns.Add(new GridViewColumn { Header = "判定方式", Width = 112, DisplayMemberBinding = new System.Windows.Data.Binding("Source") });
+            var gpathCol = new GridViewColumn { Header = "路径", Width = 470 };
+            var gtpl = new DataTemplate();
+            var gfef = new FrameworkElementFactory(typeof(TextBlock));
+            gfef.SetValue(TextBlock.TextProperty, new System.Windows.Data.Binding("Path"));
+            gfef.SetValue(FrameworkElement.ToolTipProperty, new System.Windows.Data.Binding("Path"));
+            gfef.SetValue(TextBlock.TextTrimmingProperty, TextTrimming.CharacterEllipsis);
+            gfef.SetValue(FrameworkElement.MarginProperty, new Thickness(0, 0, 10, 0));
+            gfef.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
+            gtpl.VisualTree = gfef;
+            gpathCol.CellTemplate = gtpl;
+            gv.Columns.Add(gpathCol);
             lvGame.View = gv;
             Ui.Skin(lvGame, gv);
+            lvGame.BorderThickness = new Thickness(0);
 
             emptyGame = new TextBlock
             {
@@ -2730,7 +3894,7 @@ namespace WheelLauncher
             bDir.Click += delegate { PickGame(true); };
             bFile.Click += delegate { PickGame(false); };
             bDel.Click += delegate { RemoveGameSelected(); };
-            return tab;
+            return panel;
         }
 
         public void ReloadGames()
@@ -2743,6 +3907,7 @@ namespace WheelLauncher
                 foreach (var a in Scanner.FromDesktop())
                 {
                     if (!GameWatch.IsGamePath(a.Path)) continue;
+                    if (!Settings.PauseOnStore && GameWatch.IsStoreExe(GameWatch.ExeName(a.Path))) continue;
                     bool isManual = GameList.Match(a.Path);
                     seen.Add(a.Path);
                     lvGame.Items.Add(new GameRow { Name = a.Name, Path = a.Path, Source = isManual ? "手动指定" : "游戏目录识别" });
@@ -2887,6 +4052,14 @@ namespace WheelLauncher
 
 class WheelApp : Application
     {
+        public static bool IsElevated
+        {
+            get
+            {
+                try { var id = System.Security.Principal.WindowsIdentity.GetCurrent(); return new System.Security.Principal.WindowsPrincipal(id).IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator); }
+                catch { return false; }
+            }
+        }
         public WheelApp()
         {
             ShutdownMode = ShutdownMode.OnExplicitShutdown;
@@ -2913,6 +4086,7 @@ class WheelApp : Application
         }
         MouseHook hook;
         WheelWindow wheel;
+        GridWindow grid;
         List<AppEntry> apps;
 
         double scale = 1;
@@ -2924,6 +4098,13 @@ class WheelApp : Application
         string logPath;
         static System.Threading.Mutex appMutex;
         static System.Threading.EventWaitHandle showEvent;
+        static System.Threading.EventWaitHandle quitEvent;
+        System.Windows.Interop.HwndSource hkSrc;
+        const int HK_QUICK_A = 0xB10, HK_QUICK_B = 0xB11, HK_ESC = 0xB12;
+        int lastHotkeyTick;
+        public static Action<int> HotkeyFire;
+        public static System.Windows.Threading.Dispatcher UiDispatcher;
+        static readonly string showReqFile = System.IO.Path.Combine(Paths.Root, "show.req");
 
         [STAThread]
         public static void Main()
@@ -2937,6 +4118,28 @@ class WheelApp : Application
         {
             base.OnStartup(e);
             MouseHook.AcceptInjected = e.Args.Contains("--accept-injected");
+            if (e.Args.Contains("--selftest")) { int rc = SelfTest.Run(); Shutdown(rc); return; }
+            foreach (string ga in e.Args)
+            {
+                if (ga.StartsWith("--gridtest="))
+                {
+                    int gn;
+                    if (!int.TryParse(ga.Substring(11), out gn)) gn = 60;
+                    var fake = new List<AppEntry>();
+                    string letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+                    for (int gi = 0; gi < gn; gi++)
+                    {
+                        var fe = new AppEntry();
+                        fe.Name = "App" + gi.ToString("00");
+                        fe.Path = @"C:\Windows\System32\notepad.exe";
+                        fe.Initial = letters[gi % letters.Length];
+                        fake.Add(fe);
+                    }
+                    apps = fake;
+                    Log.W("gridtest items=" + gn);
+                    Dispatcher.BeginInvoke(new Action(delegate { ShowWheel(1, 1280, 800, 1280, 800); }), System.Windows.Threading.DispatcherPriority.Loaded);
+                }
+            }
             Click.Enabled = Settings.SoundOn;
             Click.SetVolume(Settings.Volume);
             Log.W("=== start === injectedOK=" + MouseHook.AcceptInjected);
@@ -2947,10 +4150,12 @@ class WheelApp : Application
             bool created;
             appMutex = new System.Threading.Mutex(true, instName, out created);
             showEvent = new System.Threading.EventWaitHandle(false, System.Threading.EventResetMode.AutoReset, instName + ".show");
+            quitEvent = new System.Threading.EventWaitHandle(false, System.Threading.EventResetMode.AutoReset, instName + ".quit");
             if (!created)
             {
                 Log.W("another instance running, signal show and exit");
                 try { showEvent.Set(); } catch { }
+            try { System.IO.File.WriteAllText(showReqFile, "1"); } catch { }
                 Shutdown();
                 return;
             }
@@ -2960,7 +4165,11 @@ class WheelApp : Application
                 {
                     try
                     {
-                        showEvent.WaitOne();
+                        int sig = System.Threading.WaitHandle.WaitAny(new System.Threading.WaitHandle[] { showEvent, quitEvent }, 700);
+                        if (sig == 1) { Log.W("quit requested"); Dispatcher.BeginInvoke(new Action(delegate { Shutdown(); })); return; }
+                        bool relay = sig == 0;
+                        try { if (System.IO.File.Exists(showReqFile)) { System.IO.File.Delete(showReqFile); relay = true; } } catch { }
+                        if (!relay) continue;
                         Dispatcher.BeginInvoke(new Action(delegate { try { ShowAtCursor(); } catch (Exception ex) { Log.W("relay show failed: " + ex.Message); } }));
                     }
                     catch (Exception ex) { Log.W("relay loop: " + ex.Message); return; }
@@ -2992,13 +4201,7 @@ class WheelApp : Application
             };
             wd.Start();
             MouseHook.Quick += delegate(int b) { hotkeyWheel = true; Native.POINT cp; Native.GetCursorPos(out cp); ShowWheel(b, cp.x, cp.y, cp.x, cp.y); };
-            MouseHook.CommitKey += delegate
-            {
-                if (wheel == null) return;
-                var a2 = wheel.Commit();
-                CloseWheel();
-                if (a2 != null) Launcher.Run(a2);
-            };
+            MouseHook.CommitKey += delegate { KbCommit(); };
             MouseHook.ChordRelease = delegate
             {
                 // 键盘方式没有「滑动」语义：松开 A/B 不启动也不关闭，轮盘留在屏幕上等左键点击，Esc 才退出
@@ -3006,9 +4209,38 @@ class WheelApp : Application
                 Log.W("chord release keep wheel (hotkey mode)");
             };
             hook.Escape += OnEscape;
-            MouseHook.WheelOpen = delegate { return wheel != null; };
+            MouseHook.WheelOpen = delegate { return wheel != null || grid != null; };
+            if (e.Args.Contains("--fliptest"))
+            {
+                DispatcherTimerOneShot(300, delegate { var p = System.Windows.Forms.Cursor.Position; ShowWheel(1, p.X, p.Y, p.X, p.Y); });
+                DispatcherTimerOneShot(1200, delegate { Log.W("fliptest next"); WheelFlip(1); });
+                DispatcherTimerOneShot(2000, delegate { Log.W("fliptest next2"); WheelFlip(1); });
+                DispatcherTimerOneShot(2800, delegate { Log.W("fliptest prev"); WheelFlip(-1); });
+                DispatcherTimerOneShot(3600, delegate { Log.W("fliptest done"); CloseWheel(); });
+            }
+
+            MouseHook.KbMove += delegate (int kx, int ky) { KbMove(kx, ky); };
+            Gamepad.Trigger = delegate (int which)
+            {
+                Dispatcher.BeginInvoke(new Action(delegate
+                {
+                    if (wheel != null) { CloseWheel(); return; }
+                    hotkeyWheel = true;
+                    Native.POINT cp; Native.GetCursorPos(out cp);
+                    ShowWheel(which, cp.x, cp.y, cp.x, cp.y);
+                    Log.W("gamepad trigger set=" + (which == 2 ? "N-Z" : "A-M"));
+                }));
+            };
+            Gamepad.Nav = delegate (int gx, int gy) { Dispatcher.BeginInvoke(new Action(delegate { KbMove(gx, gy); })); };
+            Gamepad.Stick = delegate (double snx, double sny) { Dispatcher.BeginInvoke(new Action(delegate { StickMove(snx, sny); })); };
+            Gamepad.Commit = delegate { Dispatcher.BeginInvoke(new Action(delegate { KbCommit(); })); };
+            Gamepad.Cancel = delegate { Dispatcher.BeginInvoke(new Action(delegate { OnEscape(); })); };
+        MouseHook.PageFlip = delegate (int d) { PageFlip(d); };
+        Gamepad.Page = delegate (int d) { Dispatcher.BeginInvoke(new Action(delegate { PageFlip(d); })); };
+            Gamepad.Start();
         MouseHook.LeftClick = delegate (int lx, int ly)
         {
+            if (grid != null) { if (grid.HitGear(lx, ly, scale)) { CloseWheel(); Log.W("grid click gear -> settings"); OpenWheelSettings(); return true; } var gg = grid.CommitAt(lx, ly, scale); CloseWheel(); if (gg != null) { Log.W("grid click launch " + gg.Name); Launcher.Run(gg); } return true; }
             if (wheel == null) return false;
             System.Windows.Application.Current.Dispatcher.BeginInvoke(new Action(delegate
             {
@@ -3064,6 +4296,11 @@ class WheelApp : Application
             var auto = new WF.ToolStripMenuItem("开机自启") { CheckOnClick = true, Checked = IsAutoStart() };
             auto.CheckedChanged += (s, a) => SetAutoStart(auto.Checked);
             menu.Items.Add(auto);
+            var logonTask = new WF.ToolStripMenuItem("开机自动启动（管理员权限，无 UAC 提示）") { CheckOnClick = true, Checked = TaskInstalled() };
+            logonTask.CheckedChanged += (s, a) => { ToggleLogonTask(logonTask.Checked); tray.ShowBalloonTip(1500, "轮盘启动器", logonTask.Checked ? "已设置开机自动启动" : "已取消开机自动启动", WF.ToolTipIcon.Info); };
+            menu.Items.Add(logonTask);
+            if (!WheelApp.IsElevated)
+                menu.Items.Add("以管理员身份重启（加速器/管理员程序下也能呼出）…", null, (s, a) => RestartElevated());
             menu.Items.Add(new WF.ToolStripSeparator());
             menu.Items.Add("退出", null, (s, a) => Shutdown());
             tray.ContextMenuStrip = menu;
@@ -3095,9 +4332,38 @@ class WheelApp : Application
             }); }), DispatcherPriority.Background); }
             if (e.Args.Contains("--show2")) { Dispatcher.BeginInvoke(new Action(() => { var w = WF.Screen.PrimaryScreen.WorkingArea; ShowWheel(2, w.Width / 2, w.Height / 2, w.Width / 2 - 200, w.Height / 2); }), DispatcherPriority.Background); }
             if (e.Args.Contains("--show")) { Dispatcher.BeginInvoke(new Action(() => { var scr = WF.Screen.PrimaryScreen.WorkingArea; ShowWheel(0, scr.Width / 2, scr.Height / 2, scr.Width / 2, scr.Height / 2); }), DispatcherPriority.Background); }
+
+            try
+            {
+                var hp = new System.Windows.Interop.HwndSourceParameters("WheelLauncherHotkeys");
+                hp.Width = 1; hp.Height = 1;
+                hp.PositionX = -32000; hp.PositionY = -32000;
+                hp.WindowStyle = unchecked((int)0x80000000);
+                hp.ExtendedWindowStyle = 0x00000080 | 0x08000000;
+                MouseHook.HotkeyFire = QuickWheel;
+                MouseHook.UiDispatcher = Dispatcher;
+                hkSrc = new System.Windows.Interop.HwndSource(hp);
+                hkSrc.AddHook(HotkeyHook);
+                TryRegisterHotkeys();
+                if (!hotkeysOk)
+                {
+                    // 启动瞬间常与旧实例/其它程序抢注册，失败就每 3 秒重试，直到拿到为止
+                    var hkRetry = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
+                    hkRetry.Tick += delegate { TryRegisterHotkeys(); if (hotkeysOk) hkRetry.Stop(); };
+                    hkRetry.Start();
+                }
+            }
+            catch (Exception ex) { Log.W("hotkeys failed: " + ex.Message); }
+
+            if (e.Args.Contains("--elevated-restart"))
+            {
+                Log.W("elevated restart handover");
+                System.Threading.Thread.Sleep(1800);
+                Log.W("elevated restart continuing");
+            }
         }
 
-        void OpenSettings()
+        public void OpenSettings()
         {
             var fg = new SolidColorBrush(Ui.InkCol);
             var dim = new SolidColorBrush(Ui.SubCol);
@@ -3228,6 +4494,19 @@ class WheelApp : Application
             win.ShowDialog();
         }
 
+        static double GetScaleAt(int x, int y)
+        {
+            try
+            {
+                Native.POINT pt; pt.x = x; pt.y = y;
+                IntPtr mon = Native.MonitorFromPoint(pt, 2);
+                uint dx, dy;
+                if (mon != IntPtr.Zero && Native.GetDpiForMonitor(mon, 0, out dx, out dy) == 0 && dx > 0) return dx / 96.0;
+            }
+            catch { }
+            using (var g = System.Drawing.Graphics.FromHwnd(IntPtr.Zero)) return g.DpiX / 96.0;
+        }
+
         static double GetScale()
         {
             using (var g = System.Drawing.Graphics.FromHwnd(IntPtr.Zero)) return g.DpiX / 96.0;
@@ -3292,18 +4571,42 @@ class WheelApp : Application
             {
                 dragged = true; hadWheel = true;
                 hotkeyWheel = false;
+            kbGearHold = false;
                 showX = x; showY = y;
                 ShowWheel(downBtn, x, y, x, y);
                 Log.W("longpress show btn=" + downBtn);
             }
-            if (wheel != null) { wheel.UpdateHover(x, y, scale); lastAct = DateTime.Now; }
+            if (grid != null)
+            {
+            bool gkbHold = (kbSel != null || kbGearHold) && (DateTime.Now - kbAt).TotalSeconds < 20 && Math.Abs(x - kbCurX) < 6 && Math.Abs(y - kbCurY) < 6;
+                bool gstickHold = stickOn && Math.Abs(x - stickCurX) < 8 && Math.Abs(y - stickCurY) < 8;
+                grid.clampMode = false;
+                if (!gkbHold && !gstickHold) { kbSel = null; stickOn = false; grid.UpdateHover(x, y, scale); }
+                lastAct = DateTime.Now;
+                return;
+            }
+            if (wheel != null)
+            {
+            bool kbHold = (kbSel != null || kbGearHold) && (DateTime.Now - kbAt).TotalSeconds < 20 && Math.Abs(x - kbCurX) < 6 && Math.Abs(y - kbCurY) < 6;
+                bool stickHold = stickOn && Math.Abs(x - stickCurX) < 8 && Math.Abs(y - stickCurY) < 8;
+                if (!kbHold && !stickHold) { kbSel = null; stickOn = false; wheel.UpdateHover(x, y, scale); }
+                lastAct = DateTime.Now;
+            }
         }
 
         void OnUp(int btn, int x, int y)
         {
             if (!pressed) return;
-            if (wheel != null && hotkeyWheel) { pressed = false; Log.W("side release ignored (hotkey wheel)"); return; }
+            if (wheel != null && hotkeyWheel) { pressed = false; Log.W("side release closes hotkey wheel"); CloseWheel(); return; }
             if (wheel != null && btn != downBtn) return;   // 另一个侧键的抬起不参与提交
+            if (grid != null)
+            {
+                pressed = false;
+                var gh = grid.CommitAt(x, y, scale);
+                CloseWheel();
+                if (gh != null) { Log.W("grid release launch " + gh.Name); Launcher.Run(gh); }
+                return;
+            }
             pressed = false;
             if (wheel != null)
             {
@@ -3375,16 +4678,251 @@ class WheelApp : Application
             catch (Exception ex) { Log.W("OpenWheelSettings failed: " + ex.Message); }
         }
 
-        void OnEscape()
+        bool hotkeysOk;
+        void TryRegisterHotkeys()
         {
-            if (wheel != null) CloseWheel();
+            if (hkSrc == null) return;
+            try
+            {
+                Native.UnregisterHotKey(hkSrc.Handle, HK_QUICK_A);
+                Native.UnregisterHotKey(hkSrc.Handle, HK_QUICK_B);
+                Native.UnregisterHotKey(hkSrc.Handle, 0xB13);
+                Native.UnregisterHotKey(hkSrc.Handle, 0xB14);
+            }
+            catch { }
+            bool a1 = Native.RegisterHotKey(hkSrc.Handle, HK_QUICK_A, Native.MOD_CONTROL | Native.MOD_ALT | Native.MOD_NOREPEAT, 0x41);
+            bool a2 = Native.RegisterHotKey(hkSrc.Handle, HK_QUICK_B, Native.MOD_CONTROL | Native.MOD_ALT | Native.MOD_NOREPEAT, 0x42);
+            bool a3 = Native.RegisterHotKey(hkSrc.Handle, 0xB13, Native.MOD_NOREPEAT, 0x76);
+            bool a4 = Native.RegisterHotKey(hkSrc.Handle, 0xB14, Native.MOD_NOREPEAT, 0x77);
+            hotkeysOk = a1 && a2 && a3 && a4;
+            Log.W("hotkeys ctrl+alt+A=" + a1 + " ctrl+alt+B=" + a2 + " F7=" + a3 + " F8=" + a4);
         }
 
-        DateTime lastAct = DateTime.Now;
-        void ShowWheel(int btn, int sx, int sy, int curX, int curY)
+        IntPtr HotkeyHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            if (msg == Native.WM_HOTKEY)
+            {
+                int id = (int)wParam;
+                if (id == HK_QUICK_A) { QuickWheel(1); handled = true; }
+                else if (id == HK_QUICK_B) { QuickWheel(2); handled = true; }
+                else if (id == 0xB13) { if ((Native.GetAsyncKeyState(0x76) & 0x8000) == 0 || wheel == null) QuickWheel(1); handled = true; }
+                else if (id == 0xB14) { if ((Native.GetAsyncKeyState(0x77) & 0x8000) == 0 || wheel == null) QuickWheel(2); handled = true; }
+                else if (id == HK_ESC) { CloseWheel(); handled = true; }
+            }
+            return IntPtr.Zero;
+        }
+
+        void QuickWheel(int which)
+        {
+            // 长按热键会连发：已经在显示就直接忽略，另加 350ms 去抖
+            if (wheel != null) return;
+            if ((Environment.TickCount - lastHotkeyTick) < 350) return;
+            lastHotkeyTick = Environment.TickCount;
+            Native.POINT p;
+            Native.GetCursorPos(out p);
+            hotkeyWheel = true;
+            Log.W("hotkey quick show " + which);
+            ShowWheel(which, p.x, p.y, p.x, p.y);
+        }
+
+        void RestartElevated()
         {
             try
             {
+                if (quitEvent != null) { try { quitEvent.Set(); } catch { } }
+                var psi = new System.Diagnostics.ProcessStartInfo(WF.Application.ExecutablePath, "--elevated-restart");
+                psi.UseShellExecute = true;
+                psi.Verb = "runas";
+                System.Diagnostics.Process.Start(psi);
+                Shutdown();
+            }
+            catch (Exception ex) { Log.W("elevate failed: " + ex.Message); }
+        }
+
+        static bool TaskInstalled()
+        {
+            try
+            {
+                var p = new System.Diagnostics.ProcessStartInfo("schtasks.exe", "/Query /TN WheelLauncherAutostart");
+                p.UseShellExecute = false; p.RedirectStandardOutput = true; p.RedirectStandardError = true; p.CreateNoWindow = true;
+                using (var pr = System.Diagnostics.Process.Start(p)) { pr.WaitForExit(4000); return pr.ExitCode == 0; }
+            }
+            catch { return false; }
+        }
+
+        void ToggleLogonTask(bool on)
+        {
+            try
+            {
+                string exe = WF.Application.ExecutablePath;
+                string args = on
+                    ? "/Create /F /SC ONLOGON /RL HIGHEST /TN WheelLauncherAutostart /TR \"\\\"" + exe + "\\\"\""
+                    : "/Delete /F /TN WheelLauncherAutostart";
+                var p = new System.Diagnostics.ProcessStartInfo("schtasks.exe", args);
+                p.UseShellExecute = false; p.CreateNoWindow = true; p.RedirectStandardOutput = true; p.RedirectStandardError = true;
+                using (var pr = System.Diagnostics.Process.Start(p)) { pr.WaitForExit(8000); Log.W("logon task " + on + " exit=" + pr.ExitCode); }
+            }
+            catch (Exception ex) { Log.W("logon task failed: " + ex.Message); }
+        }
+
+        void OnEscape()
+        {
+            if (wheel != null || grid != null) CloseWheel();
+        }
+
+        DateTime lastAct = DateTime.Now;
+        List<List<Ring>> BuildWheelPages(List<AppEntry> ordered, double hub, double budget)
+        {
+            var groups = new List<List<AppEntry>>();
+            foreach (var g in ordered.GroupBy(a => a.Initial == '#' ? '[' : a.Initial).OrderBy(g2 => g2.Key))
+            {
+                var members = g.ToList();
+                if (groups.Count > 0 && members.Count <= 2 && groups[groups.Count - 1].Count <= 2)
+                    groups[groups.Count - 1].AddRange(members);
+                else
+                    groups.Add(members);
+            }
+
+            // 原逻辑：环数过多就合并相邻最小两组，最多 4 环
+            while (groups.Count > 4)
+            {
+                int bi = 0; int bs = int.MaxValue;
+                for (int i = 0; i + 1 < groups.Count; i++)
+                {
+                    int ss = groups[i].Count + groups[i + 1].Count;
+                    if (ss < bs) { bs = ss; bi = i; }
+                }
+                groups[bi].AddRange(groups[bi + 1]);
+                groups.RemoveAt(bi + 1);
+            }
+
+            // 拥挤检测：若某环的槽位间距小于图标 1.15 倍，才启用分页
+            bool crowded = groups.Count > 4;
+            if (!crowded)
+            {
+                double iconTry = Math.Min(42, Math.Max(20, (budget - hub - 10) / (1.95 + (Math.Max(1, groups.Count) - 1) * 1.55)));
+                double stepTry = iconTry * 1.55;
+                for (int i = 0; i < groups.Count; i++)
+                {
+                    double rr = hub + iconTry * 1.15 + i * stepTry;
+                    double arc = 2 * Math.PI * rr / Math.Max(1, groups[i].Count);
+                    if (arc < iconTry * 1.15) { crowded = true; break; }
+                }
+            }
+
+            List<List<AppEntry>> segs = groups;
+            if (crowded)
+            {
+                int capRing = 8;
+                segs = new List<List<AppEntry>>();
+                foreach (var grp in groups)
+                    for (int s = 0; s < grp.Count; s += capRing)
+                        segs.Add(grp.GetRange(s, Math.Min(capRing, grp.Count - s)));
+            }
+            if (segs.Count == 0) return new List<List<Ring>>();
+
+            int ringsForSizing = Math.Min(4, segs.Count);
+            wIcon = Math.Min(42, Math.Max(20, (budget - hub - 10) / (1.95 + (ringsForSizing - 1) * 1.55)));
+            double step = wIcon * 1.55;
+            wR0 = hub + wIcon * 1.15 + (ringsForSizing - 1) * step;
+
+            var pages = new List<List<Ring>>();
+            int perPage = crowded ? 4 : Math.Max(1, segs.Count);
+            for (int p = 0; p * perPage < segs.Count; p++)
+            {
+                var page = new List<Ring>();
+                for (int k = 0; k < perPage && p * perPage + k < segs.Count; k++)
+                {
+                    var items = segs[p * perPage + k];
+                    page.Add(new Ring { Letter = items[0].Initial, Part = 1, Index = k, Radius = hub + wIcon * 1.15 + k * step, Capacity = items.Count, Items = items });
+                }
+                pages.Add(page);
+            }
+
+            double maxOuter = wR0 + wIcon * 0.72;
+            if (maxOuter > budget)
+            {
+                double f0 = budget / maxOuter;
+                wIcon *= f0; wR0 *= f0;
+                foreach (var pg in pages) foreach (var r0 in pg) r0.Radius *= f0;
+            }
+            wHub = hub;
+            return pages;
+        }
+
+        string HintText()
+        {
+            string h0 = wBtn == 1 ? "A-M" : (wBtn == 2 ? "N-Z" : "全部");
+            if (wPages != null && wPages.Count > 1) h0 += "  " + (wPage + 1) + "/" + wPages.Count;
+            return h0;
+        }
+
+        string TipText()
+        {
+            if (wPages != null && wPages.Count > 1) return "滚轮 / [ ] / 手柄 LB·RB 翻页 · " + (wPage + 1) + "/" + wPages.Count + " 页 · Esc 取消";
+            return null;
+        }
+
+        void UpdateWheelRect()
+        {
+            try
+            {
+                if (wheel != null)
+                {
+                    IntPtr hw = new System.Windows.Interop.WindowInteropHelper(wheel).Handle;
+                    Native.RECT rr;
+                    if (Native.GetWindowRect(hw, out rr)) MouseHook.SetWheelRect(true, rr.Left, rr.Top, rr.Right, rr.Bottom);
+                    return;
+                }
+                if (grid != null)
+                {
+                    IntPtr hg = new System.Windows.Interop.WindowInteropHelper(grid).Handle;
+                    Native.RECT rg;
+                    if (Native.GetWindowRect(hg, out rg)) MouseHook.SetWheelRect(true, rg.Left, rg.Top, rg.Right, rg.Bottom);
+                    return;
+                }
+                MouseHook.SetWheelRect(false, 0, 0, 0, 0);
+            }
+            catch { }
+        }
+
+        void PageFlip(int d)
+        {
+            if (grid != null) { GridFlip(d); return; }
+            WheelFlip(d);
+        }
+
+        void GridFlip(int d)
+        {
+            if (grid == null) { Log.W("grid flip ignored (no grid)"); return; }
+            if (grid.PageCount < 2) { Log.W("grid flip ignored (pages=" + grid.PageCount + ")"); return; }
+            int p = (grid.PageIndex + d) % grid.PageCount;
+            if (p < 0) p += grid.PageCount;
+            grid.SetPage(p);
+            grid.UpdateLayout();
+            UpdateWheelRect();
+            Log.W("grid page " + (p + 1) + "/" + grid.PageCount);
+        }
+
+        void WheelFlip(int d)
+        {
+            if (wheel == null || wPages == null || wPages.Count < 2) return;
+            wPage = (wPage + d) % wPages.Count; if (wPage < 0) wPage += wPages.Count;
+            wheel.SetLayout(wPages[wPage], wIcon, wHub, wR0, HintText(), TipText());
+            wheel.UpdateLayout();
+            UpdateWheelRect();
+            Log.W("wheel page " + (wPage + 1) + "/" + wPages.Count);
+            lastAct = DateTime.Now;
+        }
+
+        void ShowWheel(int btn, int sx, int sy, int curX, int curY)
+        {
+            if (Settings.WheelStyle == 1) { ShowGrid(btn, sx, sy); return; }
+            try
+            {
+                scale = GetScaleAt(sx, sy);
+                kbSel = null;
+                stickOn = false; stickX = 0; stickY = 0; kbSel = null;
                 var scr = WF.Screen.FromPoint(new System.Drawing.Point(sx, sy)).WorkingArea;
                 double budget = (Math.Min(scr.Width, scr.Height) / scale / 2 - 8) * (Settings.WheelSize / 100.0);
                 double hub = 44 * (Settings.WheelSize / 100.0);
@@ -3398,55 +4936,9 @@ class WheelApp : Application
 
                 var ordered = sub.OrderBy(a => a.Initial == '#' ? '[' : a.Initial).ThenBy(a => a.Name, StringComparer.CurrentCulture).ToList();
 
-                var groups = new List<List<AppEntry>>();
-                foreach (var g in ordered.GroupBy(a => a.Initial == '#' ? '[' : a.Initial).OrderBy(g2 => g2.Key))
-                {
-                    var members = g.ToList();
-                    if (groups.Count > 0 && members.Count <= 2 && groups[groups.Count - 1].Count <= 2)
-                        groups[groups.Count - 1].AddRange(members);
-                    else
-                        groups.Add(members);
-                }
-                while (groups.Count > 4)
-                {
-                    int bi = 0, bs = int.MaxValue;
-                    for (int i2 = 0; i2 < groups.Count - 1; i2++)
-                    {
-                        int s2 = groups[i2].Count + groups[i2 + 1].Count;
-                        if (s2 < bs) { bs = s2; bi = i2; }
-                    }
-                    groups[bi].AddRange(groups[bi + 1]);
-                    groups.RemoveAt(bi + 1);
-                }
-
-                int ringsN = groups.Count;
-                double icon = Math.Min(42, Math.Max(20, (budget - hub - 10) / (1.95 + (ringsN - 1) * 1.55)));
-                double step = icon * 1.55;
-                var layout = new List<Ring>();
-                for (int k = 0; k < ringsN; k++)
-                {
-                    var items = groups[k];
-                    layout.Add(new Ring
-                    {
-                        Letter = items[0].Initial,
-                        Part = 1,
-                        Index = k,
-                        Radius = hub + icon * 1.15 + k * step,
-                        Capacity = items.Count,
-                        Items = items
-                    });
-                }
-                if (layout.Count == 0) { Log.W("no layout"); return; }
-
-                double maxOuter = 0;
-                foreach (var r0 in layout) maxOuter = Math.Max(maxOuter, r0.Radius + icon * 0.72);
-                if (maxOuter > budget)
-                {
-                    double f0 = budget / maxOuter;
-                    icon *= f0;
-                    foreach (var r0 in layout) r0.Radius *= f0;
-                }
-
+                wPages = BuildWheelPages(ordered, hub, budget);
+                if (wPages.Count == 0) { Log.W("no layout"); return; }
+                wPage = 0; wBtn = btn; wTag = tag;
                 CloseWheel();
                 System.Threading.ThreadPool.QueueUserWorkItem(delegate { Click.Warm(); });
                 wheel = new WheelWindow();
@@ -3455,17 +4947,65 @@ class WheelApp : Application
             wheel.ResetReach();
                 wheel.Pick = delegate (AppEntry a) { CloseWheel(); if (a != null) Launcher.Run(a); else Log.W("left click blank -> close wheel"); };
                 wheel.HubPick = delegate { CloseWheel(); OpenWheelSettings(); };
-                wheel.SetLayout(layout, icon, hub, 0, btn == 1 ? "侧键1 · A-M" : (btn == 2 ? "侧键2 · N-Z" : "全部应用"));
+                wheel.SetLayout(wPages[0], wIcon, wHub, wR0, HintText(), TipText());
                 wheel.PlaceAt(sx, sy, scale);
                 wheel.Show();
+                if (hkSrc != null)
+                {
+                    Native.UnregisterHotKey(hkSrc.Handle, HK_ESC);
+                    Native.RegisterHotKey(hkSrc.Handle, HK_ESC, Native.MOD_NOREPEAT, 0x1B);
+                }
+                UpdateWheelRect();
                 wheel.UpdateLayout();
                 wheel.UpdateHover(curX, curY, scale);
                 lastAct = DateTime.Now;
-                Log.W("set=" + tag + " rings=" + ringsN + " icon=" + icon.ToString("0.0") + " names=" + string.Join("|", ordered.Select(a => a.Name + ":" + a.Initial).ToArray()));
+                Log.W("set=" + tag + " rings=" + wPages[0].Count + " pages=" + wPages.Count + " icon=" + wIcon.ToString("0.0") + " names=" + string.Join("|", ordered.Select(a => a.Name + ":" + a.Initial).ToArray()));
             }
             catch (Exception ex) { Log.W("show failed: " + ex); }
             finally { if (wheel != null && !wheel.IsVisible) CloseWheel(); }
         }
+        void ShowGrid(int btn, int sx, int sy)
+        {
+            try
+            {
+                scale = GetScaleAt(sx, sy);
+                List<AppEntry> sub; string title;
+                if (btn == 1) { sub = apps.Where(a => a.Initial <= 'M').ToList(); title = "A - M"; }
+                else if (btn == 2) { sub = apps.Where(a => a.Initial >= 'N' || a.Initial == '#').ToList(); title = "N - Z"; }
+                else { sub = apps; title = "全部应用"; }
+                if (sub.Count == 0) { Log.W("empty subset grid"); return; }
+                var ordered = sub.OrderBy(a => a.Initial == '#' ? '[' : a.Initial).ThenBy(a => a.Name, StringComparer.CurrentCulture).ToList();
+                CloseWheel();
+                System.Threading.ThreadPool.QueueUserWorkItem(delegate { Click.Warm(); });
+                grid = new GridWindow(title);
+                var selfG = grid;
+                grid.Closed += delegate { if (ReferenceEquals(grid, selfG)) grid = null; };
+                var scr = WF.Screen.FromPoint(new System.Drawing.Point(sx, sy)).WorkingArea;
+                grid.Build(ordered, scr.Width / scale * 0.84, scr.Height / scale * 0.80);
+                grid.PlaceAt(sx, sy, scale);
+                grid.Show();
+                if (hkSrc != null)
+                {
+                    Native.UnregisterHotKey(hkSrc.Handle, HK_ESC);
+                    Native.RegisterHotKey(hkSrc.Handle, HK_ESC, Native.MOD_NOREPEAT, 0x1B);
+                }
+                try
+                {
+                    IntPtr hw = new System.Windows.Interop.WindowInteropHelper(grid).Handle;
+                    Native.RECT rr;
+                    if (Native.GetWindowRect(hw, out rr)) { MouseHook.SetWheelRect(true, rr.Left, rr.Top, rr.Right, rr.Bottom); Log.W("grid rect " + rr.Left + "," + rr.Top + " - " + rr.Right + "," + rr.Bottom); }
+                }
+                catch { }
+                grid.UpdateLayout();
+                grid.UpdateHover(sx, sy, scale);
+                lastAct = DateTime.Now;
+                Log.W("grid set=" + title + " items=" + ordered.Count);
+            }
+            catch (Exception ex) { Log.W("show grid failed: " + ex); }
+            finally { if (grid != null && !grid.IsVisible) CloseWheel(); }
+        }
+
+
 static int Cap(double radius, double icon)
         {
             return Math.Max(1, (int)Math.Floor(2 * Math.PI * radius / (icon + 8)));
@@ -3494,13 +5034,136 @@ static int Cap(double radius, double icon)
             return rings;
         }
 
+        AppEntry kbSel; int kbCurX, kbCurY; DateTime kbAt; bool kbGearHold;
+        List<List<Ring>> wPages; int wPage, wBtn; double wIcon, wHub, wR0; string wTag;
+        int kbLastDx, kbLastDy, kbLastTick;
+        double stickX, stickY; bool stickOn; int stickCurX, stickCurY;
+        void StickMove(double nx, double ny)
+        {
+            if (grid != null)
+            {
+                Native.POINT gp; Native.GetCursorPos(out gp); stickCurX = gp.x; stickCurY = gp.y;
+                stickOn = true; kbSel = null;
+                grid.CursorMove(nx, ny);
+                lastAct = DateTime.Now;
+                return;
+            }
+            if (wheel == null) { stickOn = false; return; }
+            if (!stickOn) { stickX = 0; stickY = 0; stickOn = true; }
+            double mag = Math.Sqrt(nx * nx + ny * ny);
+            if (mag > 1) { nx /= mag; ny /= mag; mag = 1; }
+            double step = 12 + 54 * mag;         // 每帧 DIP，越推越快
+            stickX += nx * step; stickY += ny * step;
+            double d = Math.Sqrt(stickX * stickX + stickY * stickY);
+            double maxR = wheel.MaxRadius;
+            if (d > maxR) { stickX = stickX / d * maxR; stickY = stickY / d * maxR; d = maxR; }
+            // 贴到最近的环上：避免指针停在两环之间导致高亮反复闪烁
+            double bestDiff = double.MaxValue, snapR = 0;
+            foreach (var rg in wheel.Rings)
+            {
+                double diff = Math.Abs(d - rg.Radius);
+                if (diff < bestDiff) { bestDiff = diff; snapR = rg.Radius; }
+            }
+            double hx = stickX, hy = stickY;
+            if (snapR > 0 && d > 0.001)
+            {
+                double ux = stickX / d, uy = stickY / d;
+                hx = ux * snapR; hy = uy * snapR;   // 只把「高亮落点」贴到环上，指针本身继续累加以便能往外走
+            }
+            kbSel = null;                         // 摇杆接管，取消键盘选中缓存
+            Native.POINT sp; Native.GetCursorPos(out sp); stickCurX = sp.x; stickCurY = sp.y;
+            int sx = (int)Math.Round((wheel.Left + wheel.cx + hx) * wheel.WinScale);
+            int sy = (int)Math.Round((wheel.Top + wheel.cy + hy) * wheel.WinScale);
+            wheel.UpdateHover(sx, sy, wheel.WinScale);
+            lastAct = DateTime.Now;
+        }
+        void KbMove(int dx, int dy)
+        {
+            if (grid != null)
+            {
+                grid.Move(dx, dy);
+                Native.POINT kp; Native.GetCursorPos(out kp); kbCurX = kp.x; kbCurY = kp.y; kbAt = DateTime.Now;
+            kbGearHold = grid.HubSelected; kbSel = grid.Hovered; stickOn = false;
+                lastAct = DateTime.Now;
+                return;
+            }
+            if (wheel == null) return;
+            double len = Math.Sqrt((double)dx * dx + (double)dy * dy);
+            if (len < 0.5) return;
+            if (dx == kbLastDx && dy == kbLastDy && Environment.TickCount - kbLastTick < 150) return;
+            kbLastDx = dx; kbLastDy = dy; kbLastTick = Environment.TickCount;
+            double vx = dx / len, vy = dy / len;
+
+            double curX = 0, curY = 0;
+            bool have = kbSel != null && wheel.TryPos(kbSel, out curX, out curY);
+            // 朝圆心方向 → 选中中心「设置」齿轮
+            double rl = Math.Sqrt(curX * curX + curY * curY);
+            if (rl > 1 && have)
+            {
+                double inward = ((-curX) * vx + (-curY) * vy) / rl;
+                if (inward >= 0.45)
+                {
+                    wheel.HoverHub();
+                    kbGearHold = true; kbSel = null;
+                    Native.POINT kh; Native.GetCursorPos(out kh); kbCurX = kh.x; kbCurY = kh.y; kbAt = DateTime.Now;
+                    Log.W("kb nav -> hub");
+                    lastAct = DateTime.Now;
+                    return;
+                }
+            }
+            double bestScore = double.MaxValue; AppEntry best = null;
+            foreach (var it in wheel.AllItems())
+            {
+                if (have && ReferenceEquals(it, kbSel)) continue;
+                double px, py;
+                if (!wheel.TryPos(it, out px, out py)) continue;
+                double ux = px - curX, uy = py - curY;
+                double dist = Math.Sqrt(ux * ux + uy * uy);
+                if (dist < 1) continue;
+                double dot = (ux * vx + uy * vy) / dist;
+                if (dot < 0.72) continue;
+                double score = dist / (dot * dot * dot * dot);
+                if (score < bestScore) { bestScore = score; best = it; }
+            }
+            if (best == null)
+            {
+                Log.W("kb nav none dir=" + dx + "," + dy);
+                return;
+            }
+            Native.POINT kbCur; Native.GetCursorPos(out kbCur); kbCurX = kbCur.x; kbCurY = kbCur.y; kbAt = DateTime.Now;
+            wheel.HoverItem(best);
+            kbSel = best;
+            kbSel = best; kbGearHold = false;
+        }
+        void KbCommit()
+        {
+            if (grid != null)
+            {
+                if (grid.HubSelected) { Log.W("grid kb commit gear -> settings"); CloseWheel(); OpenWheelSettings(); return; }
+                var ga = grid.Hovered; CloseWheel();
+                if (ga != null) { Log.W("grid kb launch " + ga.Name); Launcher.Run(ga); }
+                return;
+            }
+            if (wheel == null) return;
+            if (wheel.HubSelected && kbSel == null) { Log.W("kb commit hub -> settings"); CloseWheel(); OpenWheelSettings(); return; }
+            var a = kbSel != null ? kbSel : wheel.Hovered;
+            if (a == null) { Log.W("kb commit nothing -> close"); CloseWheel(); return; }
+            CloseWheel();
+            Log.W("kb launch " + a.Name);
+            Launcher.Run(a);
+        }
         void CloseWheel()
         {
+            if (hkSrc != null) { try { Native.UnregisterHotKey(hkSrc.Handle, HK_ESC); } catch { } }
+            if (grid != null) { Log.W("grid closed"); try { grid.Close(); } catch { } grid = null; }
+            if (wheel != null) Log.W("wheel closed");
+            MouseHook.SetWheelRect(false, 0, 0, 0, 0);
             hotkeyWheel = false;
             if (wheel != null)
             {
                 try { wheel.Close(); } catch { }
                 wheel = null;
+            wPages = null;
             }
         }
 
