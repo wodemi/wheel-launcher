@@ -91,12 +91,113 @@ namespace WheelLauncher
             Ensure();
             try { Pending.Enqueue(msg); } catch { }
         }
+
+        // 退出前排空队列：writer 是后台线程，不主动刷会把最后几条日志丢掉
+        public static void Drain()
+        {
+            try
+            {
+                for (int i = 0; i < 100; i++)
+                {
+                    if (Pending.IsEmpty) break;
+                    System.Threading.Thread.Sleep(15);
+                }
+            }
+            catch { }
+        }
     }
 
     public static class Paths
     {
         public static readonly string Root = System.IO.Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "WheelLauncher");
+    }
+
+    // 原子写：先写 .tmp 再替换，避免掉电/崩溃把 meta.txt、settings.ini 这类文件写坏
+    public static class FileSafe
+    {
+        // 读失败（区别于“文件不存在”）必须留痕：否则调用方会把失败当空配置，
+        // 紧接着保存就用空列表覆盖原文件，meta/games/settings 会静默丢。
+        static readonly object Gate = new object();
+        static readonly HashSet<string> BadRead = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        public static bool IsBadRead(string path) { lock (Gate) return BadRead.Contains(path); }
+        static void MarkBad(string path, Exception ex)
+        {
+            bool first;
+            lock (Gate) first = BadRead.Add(path);
+            if (first) Log.W("read failed " + System.IO.Path.GetFileName(path) + ": " + ex.Message);
+        }
+        static void ClearBad(string path) { lock (Gate) BadRead.Remove(path); }
+
+        // 成功→行数组；不存在→空数组；读失败→null（并标记坏读，后续写入被挡）
+        public static string[] Lines(string path)
+        {
+            try
+            {
+                if (!File.Exists(path)) { ClearBad(path); return new string[0]; }
+                var a = File.ReadAllLines(path, Encoding.UTF8);
+                ClearBad(path);
+                return a;
+            }
+            catch (Exception ex) { MarkBad(path, ex); return null; }
+        }
+
+        public static string Text(string path)
+        {
+            try
+            {
+                if (!File.Exists(path)) { ClearBad(path); return ""; }
+                var s = File.ReadAllText(path, Encoding.UTF8);
+                ClearBad(path);
+                return s;
+            }
+            catch (Exception ex) { MarkBad(path, ex); return null; }
+        }
+
+        public static bool WriteAllText(string path, string text)
+        {
+            if (IsBadRead(path))
+            {
+                string nm = System.IO.Path.GetFileName(path);   // 同一次失败只报一次
+                lock (Gate) { if (BadRead.Contains(nm + "|wb")) return false; BadRead.Add(nm + "|wb"); }
+                Log.W("write blocked (earlier read failed) " + nm);
+                return false;
+            }
+            try
+            {
+                var dir = System.IO.Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                var tmp = path + "." + Guid.NewGuid().ToString("N").Substring(0, 8) + ".tmp";
+                try
+                {
+                    File.WriteAllText(tmp, text, new UTF8Encoding(false));
+                    if (File.Exists(path))
+                    {
+                        try { File.Replace(tmp, path, path + ".bak"); return true; } catch { }
+                    }
+                    try
+                    {
+                        if (File.Exists(path)) { try { File.Copy(path, path + ".bak", true); } catch { } }
+                        File.Copy(tmp, path, true);
+                        return File.Exists(path);
+                    }
+                    catch { }
+                    return false;
+                }
+                finally { try { if (File.Exists(tmp)) File.Delete(tmp); } catch { } }
+            }
+            catch (Exception ex)
+            {
+                try { Log.W("filesafe write failed " + System.IO.Path.GetFileName(path) + ": " + ex.Message); } catch { }
+                return false;
+            }
+        }
+
+        public static bool WriteAllLines(string path, string[] lines)
+        {
+            return WriteAllText(path, string.Join("\r\n", lines) + "\r\n");
+        }
     }
 
     public static class Pinyin
@@ -165,7 +266,23 @@ namespace WheelLauncher
         }
 
         static readonly Dictionary<string, ImageSource> Cache = new Dictionary<string, ImageSource>(StringComparer.OrdinalIgnoreCase);
-        static void Put(string key, ImageSource img) { if (Cache.Count > 400) Cache.Clear(); Cache[key] = img; }
+        // UI 线程与后台重扫线程会并发取图标，Dictionary 不加锁会被写坏（偶发卡死/崩溃）
+        static readonly object CacheLock = new object();
+        static void Put(string key, ImageSource img)
+        {
+            if (key == null || img == null) return;   // 失败不缓存：补装程序后还能重新读到图标
+            lock (CacheLock)
+            {
+                if (Cache.Count > 400)
+                {
+                    // 不要整表清空：那会让下一次重扫把 400 个图标全部重新提取（明显的视觉/CPU 抖动）
+                    var drop = new List<string>();
+                    foreach (var kv in Cache) { drop.Add(kv.Key); if (drop.Count >= 120) break; }
+                    foreach (var k in drop) Cache.Remove(k);
+                }
+                Cache[key] = img;
+            }
+        }
 
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
         static extern IntPtr SHGetFileInfo(string pszPath, uint dwFileAttributes, ref SHFILEINFO psfi, uint cbFileInfo, uint uFlags);
@@ -207,7 +324,7 @@ namespace WheelLauncher
         {
             if (string.IsNullOrEmpty(exePath)) return null;
             ImageSource src;
-            if (Cache.TryGetValue(exePath, out src)) return src;
+            lock (CacheLock) { if (Cache.TryGetValue(exePath, out src)) return src; }
             try
             {
                 if (Directory.Exists(exePath))
@@ -242,13 +359,46 @@ namespace WheelLauncher
 
         public static string CustomFile { get { return System.IO.Path.Combine(Paths.Root, "custom.txt"); } }
 
+        static readonly string[] VendorPrefix = { "microsoft ", "mozilla ", "google ", "steam ", "adobe ", "valve ", "netease " };
+
+        // 名称清洗：去扩展名、去「快捷方式」、去厂商前缀与版本尾巴，最长 18 字
+        public static string CleanName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return name;
+            string orig = name.Trim();
+            string s = orig;
+            foreach (var ext in new string[] { ".exe", ".lnk", ".bat", ".cmd", ".url" })
+                if (s.EndsWith(ext, StringComparison.OrdinalIgnoreCase)) { s = s.Substring(0, s.Length - ext.Length); break; }
+            s = s.Replace(" - 快捷方式", "").Replace("快捷方式", "").Trim();
+            string low = s.ToLowerInvariant();
+            foreach (var vp in VendorPrefix)
+                if (low.StartsWith(vp) && s.Length > vp.Length + 2) { s = s.Substring(vp.Length); low = s.ToLowerInvariant(); break; }
+            s = System.Text.RegularExpressions.Regex.Replace(s, @"\s*[\(\（]?(x64|x86|64\s*位|32\s*位|64-bit|32-bit)[\)\）]?\s*$", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            s = System.Text.RegularExpressions.Regex.Replace(s, @"\s+v?\d+(\.\d+)+\s*$", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            s = System.Text.RegularExpressions.Regex.Replace(s, @"\s{2,}", " ").Trim();
+            if (s.Length == 0) return orig;
+            if (s.Length > 22) s = s.Substring(0, 22).Trim();
+            return s;
+        }
+
+        static readonly string[] JunkWords = { "unins", "uninst", "update", "updater", "setup", "install", "crash", "report", "helper", "vc_redist", "dxsetup", "directx", "repair", "diagnose", "feedback" };
+
+        // 安装器/卸载器/更新器/崩溃上报这类条目，默认隐藏，避免划开圆盘误点
+        public static bool LooksJunk(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return false;
+            string s = System.IO.Path.GetFileNameWithoutExtension(text).ToLowerInvariant();
+            foreach (var w in JunkWords) if (s.Contains(w)) return true;
+            return false;
+        }
+
         public static List<AppEntry> LoadCustom()
         {
             var list = new List<AppEntry>();
             try
             {
                 if (!File.Exists(CustomFile)) return list;
-                foreach (var raw in File.ReadAllLines(CustomFile, Encoding.UTF8))
+                foreach (var raw in (FileSafe.Lines(CustomFile) ?? new string[0]))
                 {
                     var line = raw.Trim();
                     if (line.Length == 0 || line.StartsWith("#")) continue;
@@ -274,7 +424,7 @@ namespace WheelLauncher
                 if (!File.Exists(CustomFile)) return false;
                 var keep = new List<string>();
                 bool removed = false;
-                foreach (var raw in File.ReadAllLines(CustomFile, Encoding.UTF8))
+                foreach (var raw in (FileSafe.Lines(CustomFile) ?? new string[0]))
                 {
                     var line = raw.Trim();
                     if (line.Length == 0) continue;
@@ -282,10 +432,94 @@ namespace WheelLauncher
                     if (p.Length >= 2 && string.Equals(p[1], path, StringComparison.OrdinalIgnoreCase)) { removed = true; continue; }
                     keep.Add(line);
                 }
-                if (removed) File.WriteAllLines(CustomFile, keep.ToArray(), Encoding.UTF8);
+                if (removed) FileSafe.WriteAllLines(CustomFile, keep.ToArray());
                 return removed;
             }
             catch { return false; }
+        }
+
+        // 列出所有固定磁盘根目录下的一级文件夹（跳过系统目录），给 AI 判断“这是不是游戏库”
+        public static List<AppEntry> DriveFolders()
+        {
+            var outp = new List<AppEntry>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            string[] skip = { "windows", "program files", "program files (x86)", "programdata", "users", "$recycle.bin",
+                "system volume information", "recovery", "perflogs", "msocache", "config.msi", "documents and settings",
+                "intel", "amd", "nvidia", "temp", "$windows.~bt", "$windows.~ws", "onedrivetemp" };
+            try
+            {
+                foreach (var d in System.IO.DriveInfo.GetDrives())
+                {
+                    if (d.DriveType != System.IO.DriveType.Fixed) continue;
+                    if (!d.IsReady) continue;
+                    string root = d.RootDirectory.FullName;
+                    string[] subs;
+                    try { subs = Directory.GetDirectories(root); } catch { continue; }
+                    foreach (var s in subs)
+                    {
+                        string name = System.IO.Path.GetFileName(s);
+                        if (string.IsNullOrEmpty(name)) continue;
+                        string low = name.ToLowerInvariant();
+                        bool bad = false;
+                        foreach (var sk in skip) if (low == sk) { bad = true; break; }
+                        if (bad || low.StartsWith("$") || low.StartsWith(".")) continue;
+                        if (name.Length <= 2) continue;
+                        if (!seen.Add(s.ToLowerInvariant())) continue;
+                        outp.Add(new AppEntry { Name = name, Path = s, Args = "", Initial = Pinyin.Get(name) });
+                        if (outp.Count >= 300) break;
+                    }
+                }
+            }
+            catch { }
+            return outp;
+        }
+
+        // 把「收录文件夹」里的程序展开成条目（只取一层，跳过卸载程序/更新器）
+        public static List<AppEntry> ExpandFolders(IEnumerable<AppEntry> seeds)
+        {
+            var outp = new List<AppEntry>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            object shell = null;
+            try { shell = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell")); } catch { }
+            foreach (var s0 in seeds)
+            {
+                if (!Directory.Exists(s0.Path)) continue;
+                string[] files;
+                try { files = Directory.GetFiles(s0.Path); } catch { continue; }
+                foreach (var f0 in files)
+                {
+                    string ext = System.IO.Path.GetExtension(f0).ToLowerInvariant();
+                    if (ext != ".exe" && ext != ".lnk" && ext != ".bat" && ext != ".cmd") continue;
+                    string nm = CleanName(System.IO.Path.GetFileNameWithoutExtension(f0));
+                    if (LooksJunk(f0) || LooksJunk(nm)) continue;
+                    string target = f0;
+        string sArg = "";
+                    if (ext == ".lnk")
+                    {
+                        target = "";
+                        sArg = "";
+                        try
+                        {
+                            if (shell != null)
+                            {
+                                dynamic sc = shell.GetType().InvokeMember("CreateShortcut", System.Reflection.BindingFlags.InvokeMethod, null, shell, new object[] { f0 });
+                                try { target = sc.TargetPath; sArg = sc.Arguments; }
+                                finally
+                                {
+                                    // IShellLink 是 RCW：不释放会随扫描次数累积（每 3 分钟一次重扫）
+                                    try { if (System.Runtime.InteropServices.Marshal.IsComObject(sc)) System.Runtime.InteropServices.Marshal.ReleaseComObject(sc); } catch { }
+                                }
+                            }
+                        }
+                        catch { }
+                        if (string.IsNullOrEmpty(target) || !File.Exists(target)) continue;
+                    }
+                    if (!seen.Add(target.ToLowerInvariant())) continue;
+                    outp.Add(new AppEntry { Name = nm, Path = target, Args = sArg, Initial = Pinyin.Get(nm) });
+                }
+            }
+            if (shell != null) { try { Marshal.ReleaseComObject(shell); } catch { } }
+            return outp;
         }
 
         public static List<AppEntry> FromDesktop()
@@ -303,10 +537,12 @@ namespace WheelLauncher
             foreach (var dir in dirs)
             {
                 if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) continue;
-                foreach (var lnk in Directory.GetFiles(dir, "*.lnk"))
+                string[] lnks;
+                try { lnks = Directory.GetFiles(dir, "*.lnk"); }
+                catch (Exception exd) { Log.W("desktop scan failed (" + dir + "): " + exd.Message); continue; }
+                foreach (var lnk in lnks)
                 {
-                    string name = System.IO.Path.GetFileNameWithoutExtension(lnk);
-            if (name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) name = name.Substring(0, name.Length - 4);
+                    string name = CleanName(System.IO.Path.GetFileNameWithoutExtension(lnk));
                     string target = "", args = "";
                     try
                     {
@@ -333,6 +569,10 @@ namespace WheelLauncher
                         name = cand;
                     }
                     list.Add(new AppEntry { Name = name, Path = target, Args = args, Initial = Pinyin.Get(name) });
+                    if ((LooksJunk(name) || LooksJunk(target)) && !Meta.Has(target))
+                    {
+                        try { Meta.Update(target, delegate (MetaEntry eh) { eh.Hidden = true; }); } catch { }
+                    }
                 }
             }
             if (shell != null) { try { Marshal.ReleaseComObject(shell); } catch { } }
@@ -922,10 +1162,13 @@ namespace WheelLauncher
     {
         static List<string> cache;
         static DateTime cacheAt;
+        static readonly object GameGate = new object();
 
         public static string FilePath { get { return System.IO.Path.Combine(Paths.Root, "games.txt"); } }
 
-        public static List<string> Load()
+        public static List<string> Load() { lock (GameGate) { return new List<string>(LoadCore()); } }
+
+        static List<string> LoadCore()
         {
             if (cache != null && (DateTime.Now - cacheAt).TotalSeconds < 2) return cache;
             var list = new List<string>();
@@ -933,7 +1176,7 @@ namespace WheelLauncher
             {
                 if (File.Exists(FilePath))
                 {
-                    foreach (var raw in File.ReadAllLines(FilePath, Encoding.UTF8))
+                    foreach (var raw in (FileSafe.Lines(FilePath) ?? new string[0]))
                     {
                         var line = raw.Trim();
                         if (line.Length == 0 || line.StartsWith("#")) continue;
@@ -953,10 +1196,14 @@ namespace WheelLauncher
             try
             {
                 Directory.CreateDirectory(Paths.Root);
-                var all = Load();
-                foreach (var q in all) if (string.Equals(q, path, StringComparison.OrdinalIgnoreCase)) return;
-                File.AppendAllText(FilePath, path + "\r\n", Encoding.UTF8);
-                cache = null;
+                lock (GameGate)
+                {
+                    var all = LoadCore();
+                    foreach (var q in all) if (string.Equals(q, path, StringComparison.OrdinalIgnoreCase)) return;
+                    all.Add(path);
+                    FileSafe.WriteAllLines(FilePath, all.ToArray());
+                    cache = null;
+                }
             }
             catch (Exception ex) { Log.W("gamelist add failed: " + ex.Message); }
         }
@@ -968,14 +1215,14 @@ namespace WheelLauncher
                 if (!File.Exists(FilePath)) return false;
                 var keep = new List<string>();
                 bool removed = false;
-                foreach (var raw in File.ReadAllLines(FilePath, Encoding.UTF8))
+                foreach (var raw in (FileSafe.Lines(FilePath) ?? new string[0]))
                 {
                     var line = raw.Trim();
                     if (line.Length == 0) continue;
                     if (string.Equals(line, path, StringComparison.OrdinalIgnoreCase)) { removed = true; continue; }
                     keep.Add(line);
                 }
-                if (removed) { File.WriteAllLines(FilePath, keep.ToArray(), Encoding.UTF8); cache = null; }
+                if (removed) { FileSafe.WriteAllLines(FilePath, keep.ToArray()); cache = null; }
                 return removed;
             }
             catch { return false; }
@@ -1004,7 +1251,12 @@ namespace WheelLauncher
             "lockapp", "lockapphost", "logonui", "textinputhost", "ctfmon", "widgets", "searchapp", "searchui",
             "sihost", "useroobebroker", "nahimic3", "nahimicsvc", "audiodg", "rundll32", "dllhost", "sppsvc",
             "sticky notes", "stickynotes", "calculatorapp", "photos", "photoshop", "illustrator", "word", "excel",
-            "powerpnt", "wps", "wpp", "et", "acrobat", "acrord32", "foxitreader", "thunderbird", "outlook" };
+            "powerpnt", "wps", "wpp", "et", "acrobat", "acrord32", "foxitreader", "thunderbird", "outlook",
+            // 平台客户端自身界面不是游戏：它们的父进程是 steam.exe / epicgameslauncher.exe 一类商店进程，
+            // 不排除的话 Steam 主界面会被 store: 规则判成“游戏”，轮盘在这个界面里被误暂停
+            "steamwebhelper", "steam", "steamservice", "gameoverlayui", "steamerrorreporter",
+            "epicwebhelper", "eosoverlayrenderer", "wegame", "wegames", "riotclientservices",
+            "battle.net", "agent", "eaapp", "eadesktop", "origin", "ubisoftconnect", "upc", "galaxyclient" };
 
         static readonly string[] GameDirs = { "\\steamapps\\common\\", "\\steam library\\", "\\epic games\\", "\\gog games\\",
             "\\gog galaxy\\games\\", "\\wegameapps\\", "\\riot games\\", "\\battle.net\\", "\\ea games\\", "\\origin games\\",
@@ -1183,9 +1435,11 @@ namespace WheelLauncher
             {
                 AccelFg = accel;
                 Log.W(accel ? ("accel pause (" + bare + ")") : "accel resume");
+                var ch0 = Changed;
+                if (ch0 != null) ch0(Suspended);   // 加速器放行状态变化也要通知 UI（收盘/换托盘提示）
             }
 
-            string why; bool game = IsGame(fg, out why);
+            string why = ""; bool game = Settings.AutoPause && IsGame(fg, out why);
             if (game != Suspended)
             {
                 Suspended = game;
@@ -1219,12 +1473,30 @@ namespace WheelLauncher
             t.Start();
         }
 
+        // 只按路径判断（没有窗口也能判）：NotGame / 商店 / games.txt / 游戏目录特征
+        public static bool IsGamePathDeep(string path, out string why)
+        {
+            why = "-";
+            if (string.IsNullOrEmpty(path)) return false;
+            string exe = ExeName(path);
+            if (exe.Length == 0) return false;
+            string bare = exe.EndsWith(".exe") ? exe.Substring(0, exe.Length - 4) : exe;
+            if (Array.IndexOf(NotGame, bare) >= 0) return false;
+            if (IsStoreExe(bare)) { if (Settings.PauseOnStore) { why = "storeui:" + bare; return true; } return false; }
+            if (GameList.Match(path)) { why = "manual:" + exe; return true; }
+            string low = path.ToLowerInvariant();
+            foreach (var d in GameDirs) { if (low.Contains(d)) { why = "path:" + d.Trim('\\'); return true; } }
+            return false;
+        }
+
         public static void TestPid(int pid)
         {
             string ppath = PidPath(pid);
             IntPtr hwnd = IntPtr.Zero;
             try { hwnd = System.Diagnostics.Process.GetProcessById(pid).MainWindowHandle; } catch { }
-            string why; bool g = IsGame(hwnd, out why);
+            string why; bool g;
+            if (hwnd == IntPtr.Zero) g = IsGamePathDeep(ppath, out why);   // 没有窗口也要能判路径规则
+            else g = IsGame(hwnd, out why);
             Log.W("gametest pid=" + pid + " hwnd=" + hwnd + " game=" + g + " why=" + why + " path=" + ppath);
         }
     }
@@ -1429,6 +1701,23 @@ namespace WheelLauncher
     public class GridWindow : Window
     {
         public List<AppEntry> Items = new List<AppEntry>();
+        public static GridWindow Active;   // 当前活动的方格面板；钩子据此决定要不要吞左键
+
+        // 与 WheelWindow.Live 对称：Close() 万一抛异常被吞，这里还留着引用，
+        // 看门狗 / 急救键才能把它扫掉；否则屏幕上会留一块永久 Topmost 的死区。
+        public static readonly System.Collections.Generic.List<GridWindow> Live = new System.Collections.Generic.List<GridWindow>();
+        public static void KillAll()
+        {
+            Active = null;
+            var arr = Live.ToArray();
+            Live.Clear();
+            foreach (var w in arr)
+            {
+                try { w.Topmost = false; } catch { }
+                try { w.Close(); } catch { }
+                try { w.Hide(); } catch { }
+            }
+        }
         public List<Ring> Rings { get { return new List<Ring>(); } }
         public double MaxRadius { get { return 0; } }
         public AppEntry Hovered;
@@ -1455,6 +1744,8 @@ namespace WheelLauncher
 
         public GridWindow(string title)
         {
+            Live.Add(this);
+            Closed += delegate { Live.Remove(this); };
             WindowStyle = WindowStyle.None;
             AllowsTransparency = true;
             Background = Brushes.Transparent;
@@ -1472,8 +1763,10 @@ namespace WheelLauncher
             Items = list;
             lastMaxW = maxW; lastMaxH = maxH;
             var groups = new List<KeyValuePair<char, List<AppEntry>>>();
-            foreach (var g in list.GroupBy(a => a.Initial == '#' ? '[' : a.Initial).OrderBy(g2 => g2.Key))
-                groups.Add(new KeyValuePair<char, List<AppEntry>>(g.Key, g.ToList()));
+            var pinnedG = list.Where(a => Meta.Get(a.Path).Pin).ToList();
+                if (pinnedG.Count > 0) groups.Add(new KeyValuePair<char, List<AppEntry>>(pinnedG[0].Initial, pinnedG));
+                foreach (var g in list.Where(a => !Meta.Get(a.Path).Pin).GroupBy(a => a.Initial == '#' ? '[' : a.Initial).OrderBy(g2 => g2.Key))
+                    groups.Add(new KeyValuePair<char, List<AppEntry>>(g.Key, g.ToList()));
 
             int rowsPerCol0 = Math.Max(1, (int)Math.Floor((maxH - 90) / (88 + 10)));
             int maxTiles = Math.Max(1, (int)Math.Floor((maxW - padL * 2 - 24) / (74 + 8)));
@@ -1508,6 +1801,7 @@ namespace WheelLauncher
         void DrawGroups(List<KeyValuePair<char, List<AppEntry>>> groups, double maxW, double maxH)
         {
             tiles.Clear(); caps.Clear(); tcx.Clear(); tcy.Clear();
+            lastIdx = -1; Hovered = null;   // 翻页后必须复位，否则松手会启动上一页同位置的条目
             cv = new Canvas();
             Content = cv;
 
@@ -1720,7 +2014,7 @@ namespace WheelLauncher
                 tiles[i].Background = new SolidColorBrush(i == idx ? Ui.Mix(Ui.CardCol, Ui.AccentCol, 0.30) : Ui.Mix(Ui.CardCol, Ui.BgCol, 0.35));
                 tiles[i].BorderBrush = new SolidColorBrush(i == idx ? Ui.AccentCol : Ui.LineCol);
             }
-            if (idx >= 0 && idx < tiles.Count)
+            if (idx >= 0 && idx < tiles.Count && idx < tcx.Count && idx < tcy.Count)
             {
                 Hovered = (AppEntry)tiles[idx].Tag;
                 tip.Text = Hovered.Name;
@@ -1743,7 +2037,9 @@ namespace WheelLauncher
 
         public void Move(int dx, int dy)
         {
+            int nItem = Math.Min(Items.Count, Math.Min(tcx.Count, tcy.Count));
             int cur = Hovered == null ? -1 : Items.IndexOf(Hovered);
+            if (cur >= nItem) cur = -1;
             bool fromGear = gearSel;
             bool fresh = cur < 0 && !fromGear;
             double ox, oy;
@@ -1760,7 +2056,7 @@ namespace WheelLauncher
             {
                 double md = pass == 0 ? minDot : 0.45;
                 double gd = pass == 0 ? gearDot : 0.40;
-                for (int i = 0; i < Items.Count; i++)
+                for (int i = 0; i < nItem; i++)
                 {
                     if (i == cur) continue;
                     double ux = tcx[i] - ox, uy = tcy[i] - oy;
@@ -1825,11 +2121,763 @@ namespace WheelLauncher
         public AppEntry CommitAt(int sx, int sy, double scale) { UpdateHover(sx, sy, scale); return Commit(); }
     }
 
+    public class MetaEntry
+    {
+        public string Path;
+        public bool Pin;
+        public int Order;
+        public bool Hidden;
+        public string Set = "auto";
+        public string Cat = "";
+    }
+
+    public static class Meta
+    {
+        static string file { get { return System.IO.Path.Combine(Paths.Root, "meta.txt"); } }
+        static DateTime stamp = DateTime.MinValue;
+        static Dictionary<string, MetaEntry> cache;
+
+        static string K(string p) { return (p ?? "").Trim().ToLowerInvariant(); }
+
+        public static void Reload() { cache = null; stamp = DateTime.MinValue; }
+
+        static readonly object Gate = new object();
+
+        static void Ensure() { lock (Gate) { EnsureCore(); } }
+
+        static void EnsureCore()
+        {
+            DateTime now = File.Exists(file) ? File.GetLastWriteTimeUtc(file) : DateTime.MinValue;
+            if (cache != null && now == stamp) return;
+            var d = new Dictionary<string, MetaEntry>(StringComparer.OrdinalIgnoreCase);
+            var lines = FileSafe.Lines(file);
+            if (lines == null)
+            {
+                // 读失败：保留旧缓存、不推进时间戳（下次重试），也绝不让随后的保存覆盖原文件
+                if (cache == null) cache = d;
+                // 读失败已在 FileSafe 里记过一次日志，这里不再刷屏
+                return;
+            }
+            foreach (var raw in lines)
+            {
+                var line = raw.Trim();
+                if (line.Length == 0 || line.StartsWith("#")) continue;
+                var p = line.Split('|');
+                if (p[0].Trim().Length == 0) continue;
+                var e = new MetaEntry();
+                e.Path = p[0];
+                e.Pin = p.Length > 1 && p[1] == "1";
+                int o = 0; if (p.Length > 2) int.TryParse(p[2], out o); e.Order = o;
+                e.Hidden = p.Length > 3 && p[3] == "1";
+                e.Set = p.Length > 4 && p[4].Length > 0 ? p[4] : "auto";
+                e.Cat = p.Length > 5 ? p[5] : "";
+                d[K(e.Path)] = e;
+            }
+            cache = d; stamp = now;
+        }
+
+        public static MetaEntry Get(string path)
+        {
+            lock (Gate)
+            {
+                Ensure();
+                MetaEntry e;
+                if (cache.TryGetValue(K(path), out e)) return e;
+                return new MetaEntry { Path = path, Set = "auto" };
+            }
+        }
+
+        // 是否已经在 meta.txt 里留下过记录（用于“只隐藏一次”的判断）
+        public static bool Has(string path)
+        {
+            lock (Gate) { Ensure(); return cache.ContainsKey(K(path)); }
+        }
+
+        public static List<MetaEntry> All() { lock (Gate) { Ensure(); return new List<MetaEntry>(cache.Values); } }
+
+        public static void SaveAll()
+        {
+            try
+            {
+                Directory.CreateDirectory(Paths.Root);
+                var sb = new StringBuilder();
+                sb.AppendLine("# path|pin|order|hidden|set|cat");
+                foreach (var e in All())
+                    sb.AppendLine(e.Path + "|" + (e.Pin ? "1" : "0") + "|" + e.Order + "|" + (e.Hidden ? "1" : "0") + "|" + (e.Set == null ? "auto" : e.Set) + "|" + (e.Cat == null ? "" : e.Cat));
+                FileSafe.WriteAllText(file, sb.ToString());
+                stamp = File.GetLastWriteTimeUtc(file);
+            }
+            catch (Exception ex) { Log.W("meta save failed: " + ex.Message); }
+        }
+
+        public static void Update(string path, Action<MetaEntry> f)
+        {
+            lock (Gate)
+            {
+                Ensure();
+                var e = Get(path);
+                e.Path = path;
+                f(e);
+                cache[K(path)] = e;
+                SaveAll();
+            }
+        }
+
+        public static char KeyOf(AppEntry a) { return a.Initial == '#' ? '[' : a.Initial; }
+
+        public static List<AppEntry> Apply(List<AppEntry> src)
+        {
+            Ensure();
+            var list = new List<AppEntry>();
+            int hid = 0;
+            foreach (var a in src) { if (Get(a.Path).Hidden) { hid++; continue; } list.Add(a); }
+            if (hid > 0) Log.W("meta hidden " + hid + "/" + src.Count);
+            list.Sort(delegate (AppEntry x, AppEntry y)
+            {
+                var mx = Get(x.Path); var my = Get(y.Path);
+                if (mx.Pin != my.Pin) return mx.Pin ? -1 : 1;
+                if (mx.Order != my.Order) return mx.Order.CompareTo(my.Order);
+                char kx = KeyOf(x), ky = KeyOf(y);
+                if (kx != ky) return kx.CompareTo(ky);
+                return string.Compare(x.Name, y.Name, StringComparison.CurrentCulture);
+            });
+            return list;
+        }
+    }
+    public class AiProvider
+    {
+        public string Name;
+        public string Base;
+        public string Model;
+        public string Key;
+    }
+
+    public static class AiStore
+    {
+        static string file { get { return System.IO.Path.Combine(Paths.Root, "ai.txt"); } }
+        static List<AiProvider> list;
+
+        public static List<AiProvider> Defaults()
+        {
+            var d = new List<AiProvider>();
+            d.Add(new AiProvider { Name = "火山方舟 (Volcengine)", Base = "https://ark.cn-beijing.volces.com/api/v3", Model = "deepseek-v4-1-flash-261017" });
+            d.Add(new AiProvider { Name = "DeepSeek 官方", Base = "https://api.deepseek.com/v1", Model = "deepseek-chat" });
+            d.Add(new AiProvider { Name = "OpenAI", Base = "https://api.openai.com/v1", Model = "gpt-4o-mini" });
+            d.Add(new AiProvider { Name = "阿里通义 (DashScope)", Base = "https://dashscope.aliyuncs.com/compatible-mode/v1", Model = "qwen-plus" });
+            d.Add(new AiProvider { Name = "月之暗面 Kimi", Base = "https://api.moonshot.cn/v1", Model = "moonshot-v1-8k" });
+            d.Add(new AiProvider { Name = "智谱 GLM", Base = "https://open.bigmodel.cn/api/paas/v4", Model = "glm-4-flash" });
+            d.Add(new AiProvider { Name = "硅基流动 SiliconFlow", Base = "https://api.siliconflow.cn/v1", Model = "Qwen/Qwen2.5-7B-Instruct" });
+            d.Add(new AiProvider { Name = "自定义 (OpenAI 兼容)", Base = "", Model = "" });
+            return d;
+        }
+
+        public static List<AiProvider> Load()
+        {
+            if (list != null) return list;
+            var d = Defaults();
+            try
+            {
+                if (File.Exists(file))
+                    foreach (var raw in (FileSafe.Lines(file) ?? new string[0]))
+                    {
+                        var line = raw.Trim();
+                        if (line.Length == 0 || line.StartsWith("#")) continue;
+                        var p = line.Split('|');
+                        if (p.Length < 3) continue;
+                        var hit = d.Find(delegate (AiProvider x) { return string.Equals(x.Name, p[0], StringComparison.OrdinalIgnoreCase); });
+                        if (hit == null) { hit = new AiProvider(); hit.Name = p[0]; d.Add(hit); }
+                        hit.Base = p[1]; hit.Model = p[2]; hit.Key = p.Length > 3 ? p[3] : "";
+                    }
+            }
+            catch { }
+            list = d;
+            return list;
+        }
+
+        public static void Save()
+        {
+            try
+            {
+                var sb = new StringBuilder();
+                sb.AppendLine("# 名称|接口地址|模型|Key   （这一行是注释，可以直接编辑本文件）");
+                foreach (var p in Load())
+                    sb.AppendLine(p.Name + "|" + (p.Base ?? "") + "|" + (p.Model ?? "") + "|" + (p.Key ?? ""));
+                FileSafe.WriteAllText(file, sb.ToString());
+            }
+            catch (Exception ex) { Log.W("ai save failed: " + ex.Message); }
+        }
+
+        public static AiProvider Current()
+        {
+            var l = Load();
+            var p = l.Find(delegate (AiProvider x) { return string.Equals(x.Name, Settings.AiProviderName, StringComparison.OrdinalIgnoreCase); });
+            if (p == null) p = l[0];
+            return p;
+        }
+    }
+
+    // 本地分类规则：AI 判过一次就把「路径特征 → 类别」记下来，下次同类路径直接命中，不再花 token
+    public static class MetaRules
+    {
+        public static string FilePath { get { return System.IO.Path.Combine(Paths.Root, "rules.txt"); } }
+
+        static List<string[]> rules;
+        static DateTime stamp = DateTime.MinValue;
+        static readonly object Gate = new object();   // 规则表会被 UI 线程与分类后台线程同时读写
+
+        public static int Count { get { lock (Gate) { Reload(); return rules == null ? 0 : rules.Count; } } }
+
+        static void Reload()
+        {
+            try
+            {
+                if (!File.Exists(FilePath)) { rules = new List<string[]>(); stamp = DateTime.MinValue; return; }
+                var st = File.GetLastWriteTimeUtc(FilePath);
+                if (rules != null && st == stamp) return;
+                var list = new List<string[]>();
+                foreach (var raw in (FileSafe.Lines(FilePath) ?? new string[0]))
+                {
+                    var line = raw.Trim();
+                    if (line.Length == 0 || line.StartsWith("#")) continue;
+                    var p = line.Split('|');
+                    if (p.Length < 2) continue;
+                    string f = p[0].Trim().ToLowerInvariant();
+                    string c = p[1].Trim().ToLowerInvariant();
+                    if (f.Length < 3 || c.Length == 0) continue;
+                    list.Add(new string[] { f, c });
+                }
+                rules = list;
+                stamp = st;
+            }
+            catch { if (rules == null) rules = new List<string[]>(); }
+        }
+
+        static readonly string[] GenericDirs = { "bin", "app", "apps", "program", "programs", "x64", "x86", "win64", "64bit", "32bit", "launcher", "dist", "release", "runtime", "core", "common", "data", "lib" };
+
+        // 太泛 / 会大面积误伤的特征词：命中了就等于"全部同类"，必须排除
+        static readonly string[] BadFeatures = { "desktop", "documents", "downloads", "videos", "pictures", "music", "favorites", "onedrive", "desktopdirectory", "桌面", "文档", "下载", "视频", "图片", "音乐", "收藏夹", "users", "windows", "system32", "syswow64", "program files", "program files (x86)", "programdata", "appdata", "application", "local", "roaming", "temp", "public", "default" };
+
+        static bool BadFeature(string f)
+        {
+            if (string.IsNullOrEmpty(f) || f.Length < 3) return true;
+            string me = Environment.UserName.ToLowerInvariant();
+            if (f == me) return true;
+            foreach (var b in BadFeatures) if (f == b) return true;
+            return false;
+        }
+
+        // 取「父目录名」当特征（比 exe 名更稳，同一个程序换个 exe 名也能认）
+        static string Feature(string path)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(path)) return "";
+                string p = path.TrimEnd('\\');
+                string stem = System.IO.Path.GetFileNameWithoutExtension(p);
+                string fallback = stem == null ? "" : stem.ToLowerInvariant();
+                string parent = System.IO.Path.GetDirectoryName(p);
+                if (!string.IsNullOrEmpty(parent))
+                {
+                    string dir = System.IO.Path.GetFileName(parent);
+                    string f = dir == null ? "" : dir.ToLowerInvariant();
+                    if (f.Length >= 3 && Array.IndexOf(GenericDirs, f) < 0 && !BadFeature(f)) return f;
+                }
+                return BadFeature(fallback) ? "" : fallback;
+            }
+            catch { return ""; }
+        }
+
+        public static string Match(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return "";
+            lock (Gate)
+            {
+                Reload();
+                if (rules == null || rules.Count == 0) return "";
+                var snap = rules.ToArray();   // 快照：别的线程可能在 Learn/Save 时改这个列表
+                string low = path.ToLowerInvariant();
+                foreach (var r in snap) { if (!BadFeature(r[0]) && low.Contains(r[0])) return r[1]; }
+                return "";
+            }
+        }
+
+        public static bool Learn(string path, string cat)
+        {
+            if (string.IsNullOrEmpty(cat)) return false;
+            string f = Feature(path);
+            if (f.Length < 3) return false;
+            lock (Gate)
+            {
+                Reload();
+                if (rules == null) rules = new List<string[]>();
+                foreach (var r in rules) { if (r[0] == f) { if (r[1] == cat) return false; r[1] = cat; Save(); return true; } }
+                rules.Add(new string[] { f, cat });
+                Save();
+                return true;
+            }
+        }
+
+        static void Save()
+        {
+            try
+            {
+                Directory.CreateDirectory(Paths.Root);
+                var lines = new List<string>();
+                lines.Add("# 路径特征|类别   由 AI 分类自动积累，命中后不再调用接口");
+                var snap = rules == null ? new string[0][] : rules.ToArray();
+                foreach (var r in snap) lines.Add(r[0] + "|" + r[1]);
+                FileSafe.WriteAllLines(FilePath, lines.ToArray());
+                stamp = File.GetLastWriteTimeUtc(FilePath);
+            }
+            catch { }
+        }
+
+        public static void Clear()
+        {
+            try { if (File.Exists(FilePath)) File.Delete(FilePath); } catch { }
+            rules = new List<string[]>();
+            stamp = DateTime.MinValue;
+        }
+    }
+
+    public static class AiClassify
+    {
+        public static string LastError = "";
+
+        // 分类串行化：两个入口（AI 窗口 / 设置页）都可能被连点，并发跑会一起写
+        // meta.txt / rules.txt / custom.txt，并让 MetaRules 在枚举时被改。
+        static int busy;
+        public static bool Busy { get { return System.Threading.Volatile.Read(ref busy) != 0; } }
+        public static bool TryEnter() { return System.Threading.Interlocked.CompareExchange(ref busy, 1, 0) == 0; }
+        public static void Exit() { System.Threading.Interlocked.Exchange(ref busy, 0); }
+
+        static string Esc(string s)
+        {
+            if (s == null) return "";
+            var sb = new StringBuilder();
+            foreach (char c in s)
+            {
+                if (c == '"') sb.Append("\\\"");
+                else if (c == '\\') sb.Append("\\\\");
+                else if (c == '\r') continue;
+                else if (c == '\n') sb.Append("\\n");
+                else if (c < ' ') continue;
+                else sb.Append(c);
+            }
+            return sb.ToString();
+        }
+
+        static string Url(AiProvider p)
+        {
+            string b = (p.Base ?? "").Trim().TrimEnd('/');
+            if (b.Length == 0) return "";
+            if (b.EndsWith("/chat/completions", StringComparison.OrdinalIgnoreCase)) return b;
+            return b + "/chat/completions";
+        }
+
+        public static string Post(AiProvider p, string userText, int maxTokens, out int spentTokens)
+        {
+            spentTokens = 0;
+            LastError = "";
+            string url = Url(p);
+            if (url.Length == 0) { LastError = "接口地址为空"; return null; }
+            if (string.IsNullOrEmpty(p.Key)) { LastError = "Key 为空"; return null; }
+            string msgPart = ",\"messages\":[{\"role\":\"system\",\"content\":\"你是一个严格的分类器，只按要求输出纯文本，不要解释。\"},{\"role\":\"user\",\"content\":\"" + Esc(userText) + "\"}]}";
+            string body = "{\"model\":\"" + Esc(p.Model) + "\",\"temperature\":0,\"stream\":false,\"thinking\":{\"type\":\"disabled\"},\"max_tokens\":" + maxTokens + msgPart;
+            string bodyNoThink = "{\"model\":\"" + Esc(p.Model) + "\",\"temperature\":0,\"stream\":false,\"max_tokens\":" + maxTokens + msgPart;
+            try
+            {
+                try
+                {
+                    System.Net.ServicePointManager.SecurityProtocol = (System.Net.SecurityProtocolType)15360;
+                }
+                catch { try { System.Net.ServicePointManager.SecurityProtocol = (System.Net.SecurityProtocolType)3072; } catch { } }
+                var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+                req.Method = "POST";
+                req.ContentType = "application/json";
+                req.Headers.Add("Authorization", "Bearer " + p.Key);
+                req.Timeout = 90000;
+                req.ReadWriteTimeout = 90000;
+                string useBody = body;
+                var bytes = Encoding.UTF8.GetBytes(useBody);
+                req.ContentLength = bytes.Length;
+                using (var s = req.GetRequestStream()) s.Write(bytes, 0, bytes.Length);
+                using (var resp = (System.Net.HttpWebResponse)req.GetResponse())
+                using (var sr = new System.IO.StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                {
+                    return Extract(sr.ReadToEnd(), out spentTokens);
+                }
+            }
+            catch (System.Net.WebException wex)
+            {
+                int code = 0;
+                try
+                {
+                    var wr = wex.Response as System.Net.HttpWebResponse;
+                    if (wr != null) { code = (int)wr.StatusCode; wr.Close(); wr.Dispose(); }
+                }
+                catch { }
+                try { if (wex.Response != null) wex.Response.Close(); } catch { }
+                if (code == 400)
+                {
+                    try
+                    {
+                        try { System.Net.ServicePointManager.SecurityProtocol = (System.Net.SecurityProtocolType)15360; } catch { }
+                        var req2 = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+                        req2.Method = "POST"; req2.ContentType = "application/json";
+                        req2.Headers.Add("Authorization", "Bearer " + p.Key);
+                        req2.Timeout = 90000; req2.ReadWriteTimeout = 90000;
+                        var b2 = Encoding.UTF8.GetBytes(bodyNoThink);
+                        req2.ContentLength = b2.Length;
+                        using (var s2 = req2.GetRequestStream()) s2.Write(b2, 0, b2.Length);
+                        using (var rp2 = (System.Net.HttpWebResponse)req2.GetResponse())
+                        using (var sr2 = new System.IO.StreamReader(rp2.GetResponseStream(), Encoding.UTF8))
+                        {
+                            LastError = "（已回退到不带 thinking 参数的请求）";
+                            return Extract(sr2.ReadToEnd(), out spentTokens);
+                        }
+                    }
+                    catch (Exception ex2) { LastError = ex2.Message; Log.W("ai retry failed: " + ex2.Message); return null; }
+                }
+                LastError = wex.Message;
+                Log.W("ai request failed: " + wex.Message);
+                return null;
+            }
+            catch (Exception ex)
+            {
+                LastError = ex.Message;
+                Log.W("ai request failed: " + ex.Message);
+                return null;
+            }
+        }
+
+        static string Extract(string raw, out int spent)
+        {
+            spent = 0;
+            if (raw == null) { LastError = "空响应"; return null; }
+            int pi = raw.IndexOf("\"prompt_tokens\"");
+            if (pi > 0)
+            {
+                int q = raw.IndexOf(':', pi); int q2 = raw.IndexOf(',', q); int q3 = raw.IndexOf('}', q);
+                int end = q2 > 0 ? q2 : q3;
+                int n; if (int.TryParse(raw.Substring(q + 1, end - q - 1).Trim(), out n)) spent = n;
+            }
+            // 输出 token 也要算钱：成功响应里 completion_tokens 与 prompt_tokens 同级
+            int ti = raw.IndexOf("\"completion_tokens\"");
+            if (ti > 0)
+            {
+                int tq = raw.IndexOf(':', ti); int tq2 = raw.IndexOf(',', tq); int tq3 = raw.IndexOf('}', tq);
+                int tend = tq2 > 0 ? tq2 : tq3;
+                int tn; if (int.TryParse(raw.Substring(tq + 1, tend - tq - 1).Trim(), out tn)) spent += tn;
+            }
+            int ci = raw.IndexOf("\"content\"");
+            if (ci < 0) { LastError = "响应里没有 content： " + Trunc(raw, 240); return null; }
+            int st = raw.IndexOf('"', ci + 9);
+            if (st < 0) { LastError = "响应格式异常"; return null; }
+            var sb = new StringBuilder();
+            bool esc = false;
+            for (int i = st + 1; i < raw.Length; i++)
+            {
+                char c = raw[i];
+                if (esc) { sb.Append(c == 'n' ? '\n' : c); esc = false; continue; }
+                if (c == '\\') { esc = true; continue; }
+                if (c == '"') break;
+                sb.Append(c);
+            }
+            return sb.ToString();
+        }
+
+        static string Trunc(string s, int n) { return s == null ? "" : (s.Length <= n ? s : s.Substring(0, n)); }
+
+        public static bool Test(AiProvider p, out string msg, out int spent)
+        {
+            // 跑在 ThreadPool 里：异常不接住会直接终止进程（.NET 2.0+ 行为）
+            try
+            {
+            string r = Post(p, "只回复两个字：可用", 16, out spent);
+            if (r == null) { msg = LastError; return false; }
+            msg = "连接成功，返回：" + Trunc(r.Trim(), 40) + "（用了 " + spent + " tokens）";
+            return true;
+            }
+            catch (Exception ex)
+            {
+                msg = "测试异常：" + ex.Message; spent = 0;
+                Log.W("ai test failed: " + ex.GetType().Name + " " + ex.Message);
+                return false;
+            }
+        }
+
+        // 按批分类；返回成功标记的条数
+        static void ApplyCat(AppEntry it, string cat)
+        {
+            Meta.Update(it.Path, delegate (MetaEntry e)
+            {
+                e.Cat = cat;
+                if (Settings.AiAutoSet)
+                {
+                    if (cat == "game") e.Set = "game";
+                    else if (cat == "folder") e.Set = "folder";
+                    else e.Set = "app";
+                }
+            });
+            if (cat == "game" && Settings.AiAutoSet) { try { GameList.Add(it.Path); } catch (Exception exg) { Log.W("gamelist add failed: " + exg.Message); } }
+            // 判成游戏的是“文件夹”时：把整个目录加进游戏库，里面的程序一跑就暂停轮盘
+            if (cat == "game")
+            {
+                try
+                {
+                    if (Directory.Exists(it.Path)) { GameList.Add(it.Path); Log.W("game library: " + it.Path); }
+                }
+                catch (Exception exg) { Log.W("gamelist add dir failed: " + exg.Message); }
+            }
+        }
+
+        public static int Run(AiProvider p, List<AppEntry> items, Action<string> log, out int totalTokens)
+        {
+            return RunGuarded(p, items, log, out totalTokens);
+        }
+
+        // 串行入口：并发跑会同时写 meta/rules/custom，还会在枚举 rules 时被 UI 清空
+        public static int RunGuarded(AiProvider p, List<AppEntry> items, Action<string> log, out int totalTokens)
+        {
+            totalTokens = 0;
+            if (!TryEnter())
+            {
+                if (log != null) log("已有一次分类在进行，请等它结束再点。");
+                return 0;
+            }
+            try { return RunCore(p, items, log, out totalTokens); }
+            catch (Exception ex)
+            {
+                Log.W("ai run failed: " + ex.GetType().Name + " " + ex.Message);
+                if (log != null) log("分类中断：" + ex.Message);
+                return 0;
+            }
+            finally { Exit(); }
+        }
+
+        static int RunCore(AiProvider p, List<AppEntry> items, Action<string> log, out int totalTokens)
+        {
+            totalTokens = 0;
+            int ok = 0;
+            int batch = 30;
+            // 先跑本地规则：命中过的同类路径不再调接口
+            var todo = new List<AppEntry>();
+            int local = 0;
+            foreach (var it0 in items)
+            {
+                string lc = MetaRules.Match(it0.Path);
+                if (lc.Length > 0) { ApplyCat(it0, lc); local++; ok++; }
+                else todo.Add(it0);
+            }
+            if (log != null && local > 0) log("本地规则命中 " + local + " 条（0 token），剩余 " + todo.Count + " 条交给模型");
+            items = todo;
+            for (int start = 0; start < items.Count; start += batch)
+            {
+                var chunk = new List<AppEntry>();
+                for (int i = start; i < items.Count && chunk.Count < batch; i++) chunk.Add(items[i]);
+                var sb = new StringBuilder();
+                sb.Append("给下面每个条目判断类型，只输出每行 `编号 类别`，不要其它文字。\n");
+                sb.Append("类别只能是：game（游戏）、app（普通软件/工具）、folder（文件夹）、doc（文档文件）。\n");
+                sb.Append("路径后标注[目录]的是文件夹：判断这个文件夹里装的是不是游戏（游戏库 / 游戏安装目录 / 破解游戏合集），是就输出 game，否则输出 folder。\n");
+                for (int i = 0; i < chunk.Count; i++)
+                {
+                    string path = chunk[i].Path ?? "";
+                    if (path.Length > 90) path = path.Substring(0, 44) + "..." + path.Substring(path.Length - 40);
+                    bool isDir = false;
+                    try { isDir = Directory.Exists(chunk[i].Path); } catch { }
+                    sb.Append(i).Append('\t').Append(chunk[i].Name).Append('\t').Append(path).Append(isDir ? "\t[目录]" : "").Append('\n');
+                }
+                int spent;
+                string r = Post(p, sb.ToString(), 8 * chunk.Count + 64, out spent);
+                totalTokens += spent;
+                if (r == null) { if (log != null) log("第 " + (start / batch + 1) + " 批失败：" + LastError); break; }
+                var map = new Dictionary<int, string>();
+                foreach (var rawLine in r.Split('\n'))
+                {
+                    var line = rawLine.Trim();
+                    if (line.Length == 0) continue;
+                    var parts = line.Split(new char[] { ' ', '\t', ':', '.', '-', '，', '、' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length < 2) continue;
+                    int idx; if (!int.TryParse(parts[0].TrimStart('#'), out idx)) continue;
+                    string cat = parts[1].Trim().ToLowerInvariant();
+                    if (cat != "game" && cat != "app" && cat != "folder" && cat != "doc") continue;
+                    map[idx] = cat;
+                }
+                for (int i = 0; i < chunk.Count; i++)
+                {
+                    string cat;
+                    if (!map.TryGetValue(i, out cat)) continue;
+                    var it = chunk[i];
+                    ApplyCat(it, cat);
+                    MetaRules.Learn(it.Path, cat);
+                    ok++;
+                }
+                if (log != null) log("第 " + (start / batch + 1) + " 批完成：识别 " + map.Count + "/" + chunk.Count + "，累计 " + totalTokens + " tokens");
+            }
+            return ok;
+        }
+    }
+
+    public class AiWindow : Window
+    {
+        bool closed;   // 窗口已关：后台线程不再回写控件
+        ComboBox cb = null;
+        TextBox tbBase = null, tbModel = null, tbKey = null, tbLog = null;
+        CheckBox chkAuto = null;
+        public bool Changed;
+
+        public AiWindow()
+        {
+            Closed += delegate { closed = true; };
+            Title = "AI 分类 · 判断游戏还是应用";
+            Width = 720; Height = 620;
+            Background = new SolidColorBrush(Ui.BgCol);
+            Foreground = new SolidColorBrush(Ui.InkCol);
+            FontSize = 13;
+            WindowStartupLocation = WindowStartupLocation.CenterScreen;
+            Ui.Crisp(this);
+            var root = new Grid { Margin = new Thickness(18) };
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            var head = new StackPanel();
+            var t1 = new TextBlock { Text = "用大模型给每个条目打标签", FontSize = 18, FontWeight = FontWeights.SemiBold };
+            var t2 = new TextBlock { Text = "只发送「名称 + 路径」，每批 30 条，只让模型回「编号 类别」——token 消耗很小；已经标过的条目会跳过。", FontSize = 12, Foreground = new SolidColorBrush(Ui.SubCol), Margin = new Thickness(0, 6, 0, 12), TextWrapping = TextWrapping.Wrap };
+            head.Children.Add(t1); head.Children.Add(t2);
+
+            var form = new Grid();
+            form.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(110) });
+            form.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            for (int i = 0; i < 5; i++) form.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            cb = new ComboBox { Height = 30, Margin = new Thickness(0, 0, 0, 8) };
+            foreach (var p in AiStore.Load()) cb.Items.Add(p.Name);
+            cb.SelectedItem = Settings.AiProviderName;
+            if (cb.SelectedIndex < 0) cb.SelectedIndex = 0;
+            tbBase = new TextBox { Height = 30, Margin = new Thickness(0, 0, 0, 8), Background = new SolidColorBrush(Ui.ChipCol), Foreground = new SolidColorBrush(Ui.InkCol), BorderThickness = new Thickness(0), Padding = new Thickness(8, 0, 8, 0), VerticalContentAlignment = VerticalAlignment.Center };
+            tbModel = new TextBox { Height = 30, Margin = new Thickness(0, 0, 0, 8), Background = new SolidColorBrush(Ui.ChipCol), Foreground = new SolidColorBrush(Ui.InkCol), BorderThickness = new Thickness(0), Padding = new Thickness(8, 0, 8, 0), VerticalContentAlignment = VerticalAlignment.Center };
+            tbKey = new TextBox { Height = 30, Margin = new Thickness(0, 0, 0, 8), Background = new SolidColorBrush(Ui.ChipCol), Foreground = new SolidColorBrush(Ui.InkCol), BorderThickness = new Thickness(0), Padding = new Thickness(8, 0, 8, 0), VerticalContentAlignment = VerticalAlignment.Center };
+            chkAuto = new CheckBox { Content = "分类后自动写入所属盘；判成游戏的会同时加入「游戏与暂停」列表", IsChecked = Settings.AiAutoSet, Margin = new Thickness(0, 2, 0, 8) };
+            Ui.StyleCheck(chkAuto);
+            var rows = new FrameworkElement[] { new TextBlock { Text = "厂商预设", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 0, 8) }, cb,
+                new TextBlock { Text = "接口地址", VerticalAlignment = VerticalAlignment.Top, Margin = new Thickness(0, 6, 0, 8) }, tbBase,
+                new TextBlock { Text = "模型", VerticalAlignment = VerticalAlignment.Top, Margin = new Thickness(0, 6, 0, 8) }, tbModel,
+                new TextBlock { Text = "API Key", VerticalAlignment = VerticalAlignment.Top, Margin = new Thickness(0, 6, 0, 8) }, tbKey,
+                new TextBlock { Text = "", }, chkAuto };
+            for (int i = 0; i < rows.Length; i++)
+            {
+                Grid.SetRow(rows[i], i / 2); Grid.SetColumn(rows[i], i % 2);
+                form.Children.Add(rows[i]);
+            }
+
+            tbLog = new TextBox
+            {
+                IsReadOnly = true, AcceptsReturn = true, VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                Background = new SolidColorBrush(Ui.CardCol), Foreground = new SolidColorBrush(Ui.SubCol),
+                BorderThickness = new Thickness(0), Padding = new Thickness(10), FontSize = 12, Margin = new Thickness(0, 10, 0, 10)
+            };
+
+            var foot = new DockPanel { LastChildFill = false };
+            var bTest = Ui.MkButton("保存并测试连接", false);
+            var bRun = Ui.MkButton("开始分类", true);
+            var bClose = Ui.MkButton("关闭", false);
+            bTest.Margin = new Thickness(0, 0, 8, 0); bRun.Margin = new Thickness(0, 0, 8, 0);
+            DockPanel.SetDock(bTest, Dock.Left); DockPanel.SetDock(bRun, Dock.Left); DockPanel.SetDock(bClose, Dock.Right);
+            foot.Children.Add(bTest); foot.Children.Add(bRun); foot.Children.Add(bClose);
+
+            Grid.SetRow(head, 0); Grid.SetRow(form, 1); Grid.SetRow(tbLog, 2); Grid.SetRow(foot, 3);
+            root.Children.Add(head); root.Children.Add(form); root.Children.Add(tbLog); root.Children.Add(foot);
+            Content = root;
+
+            cb.SelectionChanged += delegate { LoadProvider(cb.SelectedItem as string); };
+            LoadProvider(cb.SelectedItem as string);
+
+            bTest.Click += delegate
+            {
+                var p = Grab();
+                AiStore.Save(); Settings.AiProviderName = p.Name;
+                Say("正在测试 " + p.Name + " …");
+                System.Threading.ThreadPool.QueueUserWorkItem(delegate
+                {
+                    string msg; int spent;
+                    bool ok = AiClassify.Test(p, out msg, out spent);
+                    Dispatcher.BeginInvoke(new Action(delegate { Say((ok ? "✔ " : "✘ ") + msg); }));
+                });
+            };
+
+            bRun.Click += delegate
+            {
+                var p = Grab();
+                AiStore.Save(); Settings.AiProviderName = p.Name;
+                var todo = new List<AppEntry>();
+                int routed = 0;
+                foreach (var a in Scanner.FromDesktop())
+                {
+                    string c0 = Meta.Get(a.Path).Cat ?? "";
+                    if (c0 == "") todo.Add(a);
+                    else if (c0 == "game") { try { GameList.Add(a.Path); routed++; } catch (Exception exr) { Log.W("route game failed: " + exr.Message); } }
+                }
+                if (routed > 0) Say("已把 " + routed + " 个已标为「游戏」的条目加入游戏与暂停列表。");
+                if (todo.Count == 0) { Say("没有需要新建标签的条目（已标过的都已归位，游戏会自动进游戏盘）。"); return; }
+                Say("开始分类 " + todo.Count + " 条（跳过已标记的）…");
+                System.Threading.ThreadPool.QueueUserWorkItem(delegate
+                {
+                    int tokens;
+                    int ok = AiClassify.Run(p, todo, delegate (string s)
+                    {
+                        Dispatcher.BeginInvoke(new Action(delegate { Say(s); }));
+                    }, out tokens);
+                    Dispatcher.BeginInvoke(new Action(delegate
+                    {
+                        Changed = true;
+                        Say("完成：写入 " + ok + " 条，共 " + tokens + " tokens。");
+                    }));
+                });
+            };
+
+            bClose.Click += delegate { Close(); };
+        }
+
+        void Say(string s)
+        {
+            if (tbLog == null || closed) return;   // 窗口已关：后台线程别再来写已销毁控件
+            tbLog.AppendText(DateTime.Now.ToString("HH:mm:ss") + "  " + s + "\r\n");
+            tbLog.ScrollToEnd();
+        }
+
+        void LoadProvider(string name)
+        {
+            if (name == null) return;
+            foreach (var p in AiStore.Load())
+            {
+                if (string.Equals(p.Name, name, StringComparison.OrdinalIgnoreCase))
+                {
+                    tbBase.Text = p.Base; tbModel.Text = p.Model; tbKey.Text = p.Key;
+                    return;
+                }
+            }
+        }
+
+        AiProvider Grab()
+        {
+            var p = new AiProvider();
+            p.Name = (cb.SelectedItem as string) ?? "自定义 (OpenAI 兼容)";
+            p.Base = (tbBase.Text ?? "").Trim();
+            p.Model = (tbModel.Text ?? "").Trim();
+            p.Key = (tbKey.Text ?? "").Trim();
+            foreach (var q in AiStore.Load())
+                if (string.Equals(q.Name, p.Name, StringComparison.OrdinalIgnoreCase)) { q.Base = p.Base; q.Model = p.Model; q.Key = p.Key; }
+            Settings.AiAutoSet = chkAuto.IsChecked == true;
+            return p;
+        }
+    }
     public static class Launcher
     {
         public static void Run(AppEntry e)
         {
-            System.Threading.ThreadPool.QueueUserWorkItem(delegate { RunNow(e); });
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate { try { RunNow(e); } catch (Exception ex) { Log.W("launch thread failed: " + ex.GetType().Name + " " + ex.Message); } });
         }
 
         static void RunNow(AppEntry e)
@@ -2012,7 +3060,7 @@ namespace WheelLauncher
         static GCHandle[] pin = new GCHandle[BufCount];
         static byte[][] buf = new byte[BufCount][];
         static bool[] written = new bool[BufCount];
-        static bool started;
+        static volatile bool started;
         static int flagsOff = -1;
         static System.Threading.Thread feeder;
         static readonly object Life = new object();
@@ -2122,14 +3170,17 @@ namespace WheelLauncher
                 }
                 for (int i = 0; i < BufCount; i++)
                 {
+                    if (!started) return;
                     if (hwo == IntPtr.Zero) break;
-                    int fl = Marshal.ReadInt32(hdr[i], flagsOff);
+                    IntPtr hh = hdr[i];
+                    if (hh == IntPtr.Zero) break;          // 已被 ShutdownStream 释放，不能再读
+                    int fl = Marshal.ReadInt32(hh, flagsOff);
                     bool done = (fl & 1) != 0;
                     if (!written[i] || done)
                     {
                         lock (Q) { Fill(buf[i]); }
-                        Marshal.WriteInt32(hdr[i], flagsOff, fl & ~1);
-                        waveOutWrite(hwo, hdr[i], sz);
+                        Marshal.WriteInt32(hh, flagsOff, fl & ~1);
+                        waveOutWrite(hwo, hh, sz);
                         written[i] = true;
                     }
                 }
@@ -2144,6 +3195,12 @@ namespace WheelLauncher
 
         static void ShutdownStream()
         {
+            // 先让喂数据的线程退出并等它真的走掉，再释放缓冲区；
+            // 反过来做（先 FreeHGlobal 再停线程）会让 Feed 读到已释放指针 → 退出时 AccessViolation 硬崩。
+            started = false;
+            var fd = feeder;
+            feeder = null;
+            if (fd != null && fd != System.Threading.Thread.CurrentThread) { try { fd.Join(400); } catch { } }
             lock (Life)
             {
                 if (hwo == IntPtr.Zero) { started = false; return; }
@@ -2216,7 +3273,7 @@ namespace WheelLauncher
                 {
                     try
                     {
-                        for (int i = 0; i < 3; i++)
+                        for (int i = 0; i < 4; i++)
                         {
                             lastUse = Environment.TickCount;
                             lock (Q) { tones.Enqueue(i == 0 ? tHigh : (i == 1 ? tMid : tLow)); }
@@ -2239,19 +3296,26 @@ namespace WheelLauncher
 
         static Dictionary<string, string> Read()
         {
+            // 加一层「按文件时间戳失效」的内存缓存：长按判定 25ms 一次，原来每 25ms 读一次 ini
+            DateTime now = File.Exists(IniFile) ? File.GetLastWriteTimeUtc(IniFile) : DateTime.MinValue;
+            if (mem != null && now == memStamp) return new Dictionary<string, string>(mem, StringComparer.OrdinalIgnoreCase);
             var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             try
             {
                 if (File.Exists(IniFile))
-                    foreach (var l in File.ReadAllLines(IniFile))
+                    foreach (var l in (FileSafe.Lines(IniFile) ?? new string[0]))
                     {
                         int i = l.IndexOf('=');
                         if (i > 0) d[l.Substring(0, i).Trim()] = l.Substring(i + 1).Trim();
                     }
             }
             catch { }
-            return d;
+            mem = d; memStamp = now;
+            return new Dictionary<string, string>(d, StringComparer.OrdinalIgnoreCase);
         }
+
+        static Dictionary<string, string> mem;
+        static DateTime memStamp = DateTime.MinValue;
 
         static int GetInt(string key, int def)
         {
@@ -2271,9 +3335,31 @@ namespace WheelLauncher
                 d[key] = value;
                 var sb = new StringBuilder();
                 foreach (var kv in d) sb.Append(kv.Key).Append('=').Append(kv.Value).Append("\r\n");
-                File.WriteAllText(IniFile, sb.ToString(), Encoding.UTF8);
+                FileSafe.WriteAllText(IniFile, sb.ToString());
+                mem = d; memStamp = File.Exists(IniFile) ? File.GetLastWriteTimeUtc(IniFile) : DateTime.MinValue;
             }
             catch { }
+        }
+
+        static string GetStr(string key, string def)
+        {
+            var d = Read(); string v;
+            if (d.TryGetValue(key, out v)) return v;
+            return def;
+        }
+
+        public static void PutStr(string key, string value) { Set(key, value); }
+
+        public static string AiProviderName
+        {
+            get { return GetStr("ai_provider", "火山方舟 (Volcengine)"); }
+            set { Set("ai_provider", value ?? ""); }
+        }
+
+        public static bool AiAutoSet
+        {
+            get { return GetInt("ai_autoset", 1) != 0; }
+            set { Set("ai_autoset", value ? "1" : "0"); }
         }
 
         public static bool SoundOn
@@ -2362,6 +3448,38 @@ namespace WheelLauncher
             set { Set("wheelstyle", value == 1 ? "1" : "0"); }
         }
 
+        public static bool AiEnabled
+        {
+            get { return GetInt("aienabled", 1) != 0; }
+            set { Set("aienabled", value ? "1" : "0"); }
+        }
+
+        public static bool AiScanFolders
+        {
+            get { return GetInt("aiscanfolders", 0) != 0; }
+            set { Set("aiscanfolders", value ? "1" : "0"); }
+        }
+
+        public static bool AiCollect
+        {
+            get { return GetInt("aicollect", 0) != 0; }
+            set { Set("aicollect", value ? "1" : "0"); }
+        }
+
+        // 扫描 C:/D: 盘根目录下的一级文件夹（用来找出“游戏库”目录，整棵子树都算游戏）
+        public static bool AiScanDrives
+        {
+            get { return GetInt("aiscandrives", 1) != 0; }
+            set { Set("aiscandrives", value ? "1" : "0"); }
+        }
+
+        // 0 = 按首字母分盘（A-M / N-Z）；1 = 按类型分盘（应用 / 游戏）
+        public static int WheelMode
+        {
+            get { return GetInt("wheelmode", 0); }
+            set { Set("wheelmode", value == 1 ? "1" : "0"); }
+        }
+
         public static int WheelSize
         {
             get
@@ -2398,6 +3516,10 @@ namespace WheelLauncher
         public static Action<int> HotkeyFire;
         public static System.Windows.Threading.Dispatcher UiDispatcher;
         static volatile bool wheelShown;
+        static volatile bool swallowedDown;   // 已吞下左键按下 → 抬起也要吞，保证配对
+        static DateTime swallowAt;
+        static DateTime lastSwallowLog;
+        public static bool RectShown { get { return wheelShown; } }
         static int wl, wt, wr, wb;
         System.Threading.Thread pump;
         volatile bool wantKeyboard;
@@ -2407,17 +3529,39 @@ namespace WheelLauncher
         public static void SetWheelRect(bool shown, int l, int t, int r, int b)
         {
             wl = l; wt = t; wr = r; wb = b; wheelShown = shown;
+            // 注意：这里绝不能清 swallowedDown。
+            // 点图标时是「钩子吞下左键 DOWN → UI 关盘 → 用户才松手」，若此处清标记，
+            // 松开那次 UP 会透传给前台程序，形成「没有按下的抬起」，Steam/CEF 一类会就此不响应左键。
+            // 标记只由配对的抬起、或 SwallowStale 超时（见看门狗）复位。
         }
+
+        public static bool SwallowStale
+        {
+            // 阈值放宽到 10 秒：宁可多吞一次抬起，也不要漏吞而把「孤儿 UP」送给前台程序
+            get { return swallowedDown && (DateTime.Now - swallowAt).TotalSeconds > 10; }
+        }
+
+        public static void ResetSwallow() { swallowedDown = false; }
         int _mvCount = 0;
 
         Native.HookProc mouseProc, keyProc;
         IntPtr mouseHook = IntPtr.Zero, keyHook = IntPtr.Zero;
         public event Action<int, int, int> SideDown;   // button, x, y
         public event Action<int, int, int> SideUp;     // button, x, y
+        // 游戏/加速器把前台抢走时抬起事件会被丢，需要让上层把“按下中”状态复位，否则之后会自动弹盘
+        public static Action SideReset;
         public event Action<int, int> Move;
         public event Action Escape;
 
         public bool Ok { get { return mouseHook != IntPtr.Zero; } }
+
+        // 退出时把两个钩子摘掉，避免热重启/残留句柄拖着系统输入链
+        public void Close()
+        {
+            try { if (mouseHook != IntPtr.Zero) { Native.UnhookWindowsHookEx(mouseHook); mouseHook = IntPtr.Zero; } } catch { }
+            try { if (keyHook != IntPtr.Zero) { Native.UnhookWindowsHookEx(keyHook); keyHook = IntPtr.Zero; } } catch { }
+            try { if (pumpTid != 0) Native.PostThreadMessage(pumpTid, 0x0012 /*WM_QUIT*/, IntPtr.Zero, IntPtr.Zero); } catch { }
+        }
 
         public void SetKeyboard(bool on)
         {
@@ -2492,24 +3636,40 @@ namespace WheelLauncher
         {
             try
             {
-                if (GameWatch.Suspended) return Native.CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+                if (GameWatch.Paused)
+                {
+                    var sr0 = SideReset;
+                    if (sr0 != null) { try { sr0(); } catch { } }
+                    return Native.CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+                }
                 if (nCode >= 0)
                 {
                     var info = (Native.MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.MSLLHOOKSTRUCT));
                     if (AcceptInjected || (info.flags & Native.LLMHF_INJECTED) == 0)
                     {
                         int msg = wParam.ToInt32();
-                        if (msg == 0x020A && wheelShown && PageFlip != null && info.pt.x >= wl && info.pt.x <= wr && info.pt.y >= wt && info.pt.y <= wb)
+                        bool openNow = WheelOpen == null || WheelOpen(); if (wheelShown && !openNow) { SetWheelRect(false, 0, 0, 0, 0); Log.W("rect self-heal (no window)"); } if (msg == 0x020A && wheelShown && openNow && PageFlip != null && info.pt.x >= wl && info.pt.x <= wr && info.pt.y >= wt && info.pt.y <= wb)
                         {
                             int wd = (short)((info.mouseData >> 16) & 0xFFFF);
                             int dir = wd > 0 ? 1 : -1;
                             System.Windows.Application.Current.Dispatcher.BeginInvoke(new Action(delegate { var pf = PageFlip; if (pf != null) { try { pf(dir); } catch { } } }));
                             return (IntPtr)1;
                         }
-                        if (msg == 0x0201 && LeftClick != null && wheelShown && info.pt.x >= wl && info.pt.x <= wr && info.pt.y >= wt && info.pt.y <= wb)
+                        bool uiOpen = (WheelWindow.Active != null && WheelWindow.Active.IsVisible && WheelWindow.Active.ActualWidth >= 100 && WheelWindow.Active.ActualHeight >= 100)
+                                   || (GridWindow.Active != null && GridWindow.Active.IsVisible && GridWindow.Active.ActualWidth >= 100 && GridWindow.Active.ActualHeight >= 100);
+                        if (msg == 0x0201 && LeftClick != null && wheelShown && openNow && uiOpen && info.pt.x >= wl && info.pt.x <= wr && info.pt.y >= wt && info.pt.y <= wb)
                         {
                             int lx = info.pt.x, ly = info.pt.y;
+                            swallowedDown = true;   // 配对的抬起也要吞掉，否则目标程序会收到“没有按下的 UP”，Steam/CEF 一类会就此不响应左键
+                            swallowAt = DateTime.Now;
+                            if ((DateTime.Now - lastSwallowLog).TotalMilliseconds > 700) { lastSwallowLog = DateTime.Now; Log.W("swallow down x=" + lx + " y=" + ly + " rect=" + wl + "," + wt + "," + wr + "," + wb); }
                             System.Windows.Application.Current.Dispatcher.BeginInvoke(new Action(delegate { try { LeftClick(lx, ly); } catch { } }));
+                            return (IntPtr)1;
+                        }
+                        if (msg == 0x0202 && swallowedDown)
+                        {
+                            swallowedDown = false;
+                            if ((DateTime.Now - lastSwallowLog).TotalMilliseconds > 700) { lastSwallowLog = DateTime.Now; Log.W("swallow up"); }
                             return (IntPtr)1;
                         }
                         if (msg == Native.WM_XBUTTONDOWN)
@@ -2538,7 +3698,7 @@ namespace WheelLauncher
         {
             try
             {
-                if (GameWatch.Suspended)
+                if (GameWatch.Paused)
                 {
                     TabDown = false; ChordFired = false; ChordUsed = false;
                     return Native.CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
@@ -2748,6 +3908,23 @@ namespace WheelLauncher
     {
         public static bool ShotMode;
 
+        // 所有活动轮盘窗口的登记表：CloseWheel 若因异常没能关掉，下一次显示/急救键还能把它清掉，
+        // 避免留下一个 Topmost 的“幽灵轮盘”把鼠标事件全吃掉（表现为整个圆盘卡死）。
+        public static readonly System.Collections.Generic.List<WheelWindow> Live = new System.Collections.Generic.List<WheelWindow>();
+        public static WheelWindow Active;   // 当前正在进行交互的那一个；其它活着的都是待清理的幽灵
+        public static void KillAll()
+        {
+            Active = null;
+            var arr = Live.ToArray();
+            Live.Clear();
+            foreach (var w in arr)
+            {
+                try { w.Topmost = false; } catch { }
+                try { w.Close(); } catch { }
+                try { w.Hide(); } catch { }
+            }
+        }
+
         public static readonly double IconGap = 4;
         public static double RingOffset(int i) { return i * 137.508 * Math.PI / 180.0; }
 
@@ -2806,6 +3983,8 @@ namespace WheelLauncher
 
         public WheelWindow()
         {
+            Live.Add(this);
+            Closed += delegate { Live.Remove(this); };
             WindowStyle = WindowStyle.None;
             AllowsTransparency = true;
             Background = Brushes.Transparent;
@@ -2836,6 +4015,7 @@ namespace WheelLauncher
         public void SetLayout(List<Ring> layout, double icon, double hubR, double r0v, string hintText, string tipText = null)
         {
             rings = layout; iconSize = icon; spacing = 0; hubRadius = hubR;
+            hovered = null; lastHit = null; lastHitAt = DateTime.MinValue; reach = 0;   // 每次重画都清掉上次的悬停记忆
             double maxR = r0v;
             foreach (var rr in rings) if (rr.Radius > maxR) maxR = rr.Radius;
             r0 = maxR;
@@ -3209,7 +4389,8 @@ namespace WheelLauncher
             {
                 UpdateHover(screenX, screenY, scale);
                 if (hovered == null) hovered = NearestIcon(screenX, screenY, scale);
-                if (hovered == null && lastHit != null && (DateTime.Now - lastHitAt).TotalMilliseconds < 450) hovered = lastHit;
+                // 不再用「450ms 内最后悬停过的项」兜底：那会让用户在空白处松手/点击时
+                // 启动一个他以为已经放弃的条目（文案写的是「点空白关闭」）。
                 var h = hovered;
                 hovered = null;
                 return h;
@@ -3241,7 +4422,9 @@ namespace WheelLauncher
                 }
             }
             if (best == null) return null;
-            return Math.Sqrt(bestD2) <= iconSize * 2.2 ? best : null;
+            // 容差从 2.2 收到 1.5 个图标：原先在环与环之间的空白处松手也会被吸到最近的图标上，
+            // 用户想取消却启动了程序。1.5 仍能吸收手抖与 150% DPI 的亚像素偏差。
+            return Math.Sqrt(bestD2) <= iconSize * 1.5 ? best : null;
         }
 
         public Action<AppEntry> Pick;
@@ -3249,20 +4432,11 @@ namespace WheelLauncher
 
         protected override void OnMouseLeftButtonUp(MouseButtonEventArgs e)
         {
+            // 左键统一交给全局钩子（MouseHook.LeftClick）处理：这里若也提交，
+            // 一次点击会触发两遍，中心齿轮会连开两个模态设置窗，圆盘因此被禁用而“卡住”。
             base.OnMouseLeftButtonUp(e);
-            try
-            {
-                var p = PointToScreen(System.Windows.Input.Mouse.GetPosition(this));
-                if (HitHub((int)Math.Round(p.X), (int)Math.Round(p.Y), winScale))
-                {
-                    var hp = HubPick;
-                    if (hp != null) hp();
-                    return;
-                }
-                var a = Commit();
-                if (Pick != null) Pick(a);
-            }
-            catch { }
+            // 幽灵窗口自救：不是当前活动轮盘，点一下就把自己关掉
+            if (Active != this) { try { Live.Remove(this); Close(); } catch { } }
         }
     }
     public class WheelSettingsWindow : Window
@@ -3300,6 +4474,7 @@ namespace WheelLauncher
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
             Ui.Crisp(this);
             BuildUi(startTab);
+            Closed += delegate { MarkAiClosed(); };
             // 列表刷新放到 BuildUi 末尾（切主题重建界面时也要刷新）
         }
 
@@ -3335,14 +4510,15 @@ namespace WheelLauncher
             var pageWheel = PageHost("圆盘内容", "圆盘上出现什么，顺序按首字母自动排。", BuildWheelPage());
             var pageGame = PageHost("游戏与暂停", "什么时候自动让开，不打扰你玩。", BuildGamePage());
             var pageLook = PageHost("外观与行为", "配色、大小、松手之后做什么。", BuildLookPage());
+            var pageAi = PageHost("AI 分类", "让模型判断每个条目是游戏还是应用，自动分盘。", BuildAiPage());
 
             var host = new Grid();
-            var pages = new FrameworkElement[] { pageWheel, pageGame, pageLook };
+            var pages = new FrameworkElement[] { pageWheel, pageGame, pageLook, pageAi };
             foreach (var pg in pages) host.Children.Add(pg);
 
             var navButtons = new List<Button>();
-            string[] navText = { "圆盘内容", "游戏与暂停", "外观与行为" };
-            for (int i = 0; i < 3; i++)
+            string[] navText = { "圆盘内容", "游戏与暂停", "外观与行为", "AI 分类" };
+            for (int i = 0; i < 4; i++)
             {
                 int idx = i;
                 var nb = Ui.MkButton(navText[i], false);
@@ -3416,7 +4592,7 @@ namespace WheelLauncher
                     b.FontWeight = sel ? FontWeights.SemiBold : FontWeights.Normal;
                 }
             };
-            ShowPage(startPage < 0 || startPage > 2 ? 0 : startPage);
+            ShowPage(startPage < 0 || startPage > 3 ? 0 : startPage);
 Dispatcher.BeginInvoke(new Action(delegate
             {
                 ReloadWheel();
@@ -3572,13 +4748,266 @@ Dispatcher.BeginInvoke(new Action(delegate
             var rbGrid = Ui.MkRadio("方格面板（按字母分行，标注更清楚、更容易点）", "wheelstyle", Settings.WheelStyle == 1);
             rbGrid.Checked += delegate { if (rbGrid.IsChecked == true) { Settings.WheelStyle = 1; Changed = true; } };
             panel.Children.Add(rbGrid);
+            var lblMode = new TextBlock();
+            lblMode.Text = "分盘方式";
+            lblMode.FontSize = 13; lblMode.Margin = new Thickness(0, 16, 0, 8);
+            lblMode.Foreground = new SolidColorBrush(Ui.InkCol);
+            panel.Children.Add(lblMode);
+            var rbLetter = Ui.MkRadio("按首字母分两个盘：A–M / N–Z", "wheelmode", Settings.WheelMode == 0);
+            rbLetter.Margin = new Thickness(0, 0, 0, 10);
+            rbLetter.Checked += delegate { if (rbLetter.IsChecked == true) { Settings.WheelMode = 0; Changed = true; } };
+            panel.Children.Add(rbLetter);
+            var rbCat = Ui.MkRadio("按类型分两个盘：应用（含文件夹）/ 游戏（用 AI 分类自动划分）", "wheelmode", Settings.WheelMode == 1);
+            rbCat.Checked += delegate { if (rbCat.IsChecked == true) { Settings.WheelMode = 1; Changed = true; } };
+            panel.Children.Add(rbCat);
             panel.Children.Add(new Border { Height = 1, Background = new SolidColorBrush(Ui.LineCol), Margin = new Thickness(0, 20, 0, 18) });
             var bMore = Ui.MkButton("长按时间与音效…", false);
             bMore.HorizontalAlignment = HorizontalAlignment.Left;
             bMore.Click += delegate { var wa = Application.Current as WheelApp; if (wa != null) wa.OpenSettings(); };
             panel.Children.Add(bMore);
+            var sc0 = new ScrollViewer
+            {
+                Content = panel,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                Padding = new Thickness(0, 0, 6, 0)
+            };
+            return sc0;
             return panel;
         }
+        ComboBox cbAi = null;
+        TextBox tbAiBase = null, tbAiModel = null, tbAiLog = null;
+        PasswordBox pbAiKey = null;
+        CheckBox chkAiOn = null, chkAiFolders = null, chkAiCollect = null, chkAiDrives = null;
+
+        void AiSay(string s)
+        {
+            if (tbAiLog == null || aiClosed) return;   // 窗口已关：后台线程别再来写已销毁控件
+            tbAiLog.AppendText(s + "\r\n");
+            tbAiLog.ScrollToEnd();
+        }
+
+        bool aiClosed;
+        void MarkAiClosed() { aiClosed = true; }
+
+        TextBox MkIn()
+        {
+            return new TextBox
+            {
+                Height = 32, Margin = new Thickness(0, 0, 0, 8),
+                Background = new SolidColorBrush(Ui.ChipCol), Foreground = new SolidColorBrush(Ui.InkCol),
+                BorderThickness = new Thickness(0), Padding = new Thickness(8, 0, 8, 0),
+                VerticalContentAlignment = VerticalAlignment.Center, FontSize = 12.5
+            };
+        }
+
+        void LoadAiProvider(string name)
+        {
+            var all = AiStore.Load();
+            AiProvider p = null;
+            foreach (var q in all) if (q.Name == name) { p = q; break; }
+            if (p == null && all.Count > 0) p = all[0];
+            if (p == null) return;
+            tbAiBase.Text = p.Base; tbAiModel.Text = p.Model; pbAiKey.Password = p.Key ?? "";
+        }
+
+        AiProvider GrabAi()
+        {
+            string nm = (cbAi.SelectedItem as string) ?? Settings.AiProviderName;
+            var all = AiStore.Load();
+            AiProvider p = null;
+            foreach (var q in all) if (string.Equals(q.Name, nm, StringComparison.OrdinalIgnoreCase)) { p = q; break; }
+            if (p == null) { p = new AiProvider(); p.Name = nm; all.Add(p); }
+            p.Base = (tbAiBase.Text ?? "").Trim();
+            p.Model = (tbAiModel.Text ?? "").Trim();
+            p.Key = (pbAiKey.Password ?? "").Trim();
+            AiStore.Save();
+            Settings.AiProviderName = nm;
+            return p;
+        }
+
+        void AiTest()
+        {
+            var p = GrabAi();
+            AiSay("正在测试 " + p.Name + " …");
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                string msg; int spent;
+                bool ok = AiClassify.Test(p, out msg, out spent);
+                Dispatcher.BeginInvoke(new Action(delegate { AiSay((ok ? "[OK] " : "[失败] ") + msg); }));
+            });
+        }
+
+        void AiRun()
+        {
+            if (!Settings.AiEnabled) { AiSay("AI 分类已关闭。先勾选上面的「启用 AI 分类」。"); return; }
+            var p = GrabAi();
+            var todo = new List<AppEntry>();
+            var known = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            int routed = 0;
+            foreach (var a in Scanner.FromDesktop())
+            {
+                known.Add(a.Path);
+                string c0 = Meta.Get(a.Path).Cat ?? "";
+                if (c0 == "") todo.Add(a);
+                else { MetaRules.Learn(a.Path, c0); if (c0 == "game") { try { GameList.Add(a.Path); routed++; } catch { } } }
+            }
+            int fromFolders = 0;
+            if (Settings.AiScanFolders)
+            {
+                var seeds = new List<AppEntry>();
+                foreach (var a in Scanner.LoadCustom()) if (Directory.Exists(a.Path)) seeds.Add(a);
+                foreach (var a in Scanner.ExpandFolders(seeds))
+                {
+                    if (known.Contains(a.Path)) continue;
+                    known.Add(a.Path);
+                    fromFolders++;
+                    if ((Meta.Get(a.Path).Cat ?? "") == "") todo.Add(a);
+                }
+            }
+            // 扫 C:/D: 盘根目录的一级文件夹：判成游戏的整棵目录子树都会自动暂停轮盘
+            int fromDrives = 0;
+            if (Settings.AiScanDrives)
+            {
+                foreach (var a in Scanner.DriveFolders())
+                {
+                    if (known.Contains(a.Path)) continue;
+                    known.Add(a.Path);
+                    fromDrives++;
+                    string c0 = Meta.Get(a.Path).Cat ?? "";
+                    if (c0 == "") todo.Add(a);
+                    else if (c0 == "game") { try { GameList.Add(a.Path); routed++; } catch { } }
+                }
+            }
+            AiSay("扫描完成：待分类 " + todo.Count + " 条（文件夹内 " + fromFolders + " 条、盘根目录 " + fromDrives + " 条），已归位游戏 " + routed + " 条。");
+            AiSay("本地分类规则：" + MetaRules.Count + " 条（命中的条目不会调用接口）。");
+            if (todo.Count == 0) { AiSay("没有需要新建标签的条目。"); return; }
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                int tokens;
+                int ok = AiClassify.Run(p, todo, delegate (string s) { Dispatcher.BeginInvoke(new Action(delegate { AiSay(s); })); }, out tokens);
+                int added = 0;
+                if (Settings.AiCollect)
+                {
+                    foreach (var a in todo)
+                    {
+                        string c0 = Meta.Get(a.Path).Cat ?? "";
+                        if (c0 == "doc" || c0 == "") continue;
+                        try { if (c0 == "game") GameList.Add(a.Path); Scanner.AddCustom(a.Name, a.Path, ""); added++; } catch { }
+                    }
+                }
+                Dispatcher.BeginInvoke(new Action(delegate
+                {
+                    Changed = true;
+                    AiSay("完成：写入 " + ok + " 条，共 " + tokens + " tokens" + (added > 0 ? "，新收录 " + added + " 条到圆盘" : "") + "。");
+                    ReloadWheel();
+                }));
+            });
+        }
+
+        FrameworkElement BuildAiPage()
+        {
+            var panel = new StackPanel { Margin = new Thickness(16, 4, 16, 12) };
+
+            chkAiOn = new CheckBox { Content = "启用 AI 分类（关闭后不会上传任何内容，也不会自动给新条目分类）", IsChecked = Settings.AiEnabled };
+            chkAiOn.Margin = new Thickness(0, 0, 0, 10);
+            Ui.StyleCheck(chkAiOn);
+            chkAiOn.Checked += delegate { Settings.AiEnabled = true; Changed = true; };
+            chkAiOn.Unchecked += delegate { Settings.AiEnabled = false; Changed = true; };
+            panel.Children.Add(chkAiOn);
+
+            var form = new Grid();
+            form.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(84) });
+            form.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            for (int i = 0; i < 4; i++) form.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            cbAi = new ComboBox { Height = 32, Margin = new Thickness(0, 0, 0, 8), FontSize = 12.5 };
+            foreach (var q in AiStore.Load()) cbAi.Items.Add(q.Name);
+            cbAi.SelectedItem = Settings.AiProviderName;
+            if (cbAi.SelectedIndex < 0) cbAi.SelectedIndex = 0;
+            tbAiBase = MkIn(); tbAiModel = MkIn();
+            pbAiKey = new PasswordBox
+            {
+                Height = 32, Margin = new Thickness(0, 0, 0, 0),
+                Background = new SolidColorBrush(Ui.ChipCol), Foreground = new SolidColorBrush(Ui.InkCol),
+                BorderThickness = new Thickness(0), Padding = new Thickness(8, 6, 8, 0),
+                FontSize = 12.5, PasswordChar = '\u25CF'
+            };
+            Action<int, string, FrameworkElement> row = delegate (int r, string lab, FrameworkElement ctl)
+            {
+                var lb = new TextBlock { Text = lab, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 8, 8), Foreground = new SolidColorBrush(Ui.SubCol), FontSize = 12.5 };
+                Grid.SetRow(lb, r); Grid.SetColumn(lb, 0); form.Children.Add(lb);
+                Grid.SetRow(ctl, r); Grid.SetColumn(ctl, 1); form.Children.Add(ctl);
+            };
+            row(0, "厂商预设", cbAi);
+            row(1, "接口地址", tbAiBase);
+            row(2, "模型", tbAiModel);
+            var keyWrap = new DockPanel { Margin = new Thickness(0, 0, 0, 8) };
+            var bEye = Ui.MkButton("\u25C9 显示", false);
+            bEye.Height = 32; bEye.MinWidth = 74; bEye.Margin = new Thickness(8, 0, 0, 0); bEye.FontSize = 12;
+            DockPanel.SetDock(bEye, Dock.Right);
+            bEye.Click += delegate
+            {
+                if (pbAiKey.PasswordChar != '\0') { pbAiKey.PasswordChar = '\0'; bEye.Content = "\u25C9 隐藏"; }
+                else { pbAiKey.PasswordChar = '\u25CF'; bEye.Content = "\u25C9 显示"; }
+            };
+            keyWrap.Children.Add(bEye);
+            keyWrap.Children.Add(pbAiKey);
+            row(3, "API Key", keyWrap);
+            panel.Children.Add(form);
+
+            var opts = new WrapPanel { Margin = new Thickness(0, 4, 0, 10) };
+            chkAiFolders = new CheckBox { Content = "扫描收录文件夹里的程序（桌面以外）", IsChecked = Settings.AiScanFolders, Margin = new Thickness(0, 4, 24, 0) };
+            Ui.StyleCheck(chkAiFolders);
+            chkAiFolders.Checked += delegate { Settings.AiScanFolders = true; };
+            chkAiFolders.Unchecked += delegate { Settings.AiScanFolders = false; };
+            opts.Children.Add(chkAiFolders);
+            chkAiCollect = new CheckBox { Content = "把新发现的游戏/应用也收进圆盘", IsChecked = Settings.AiCollect, Margin = new Thickness(0, 4, 24, 0) };
+            Ui.StyleCheck(chkAiCollect);
+            chkAiCollect.Checked += delegate { Settings.AiCollect = true; };
+            chkAiCollect.Unchecked += delegate { Settings.AiCollect = false; };
+            opts.Children.Add(chkAiCollect);
+            chkAiDrives = new CheckBox { Content = "扫描 C:/D: 盘根目录的全部文件夹（找出游戏库，整目录运行即暂停）", IsChecked = Settings.AiScanDrives, Margin = new Thickness(0, 4, 24, 0) };
+            Ui.StyleCheck(chkAiDrives);
+            chkAiDrives.Checked += delegate { Settings.AiScanDrives = true; };
+            chkAiDrives.Unchecked += delegate { Settings.AiScanDrives = false; };
+            opts.Children.Add(chkAiDrives);
+            panel.Children.Add(opts);
+
+            var sepA = new Border { Height = 1, Background = new SolidColorBrush(Ui.LineCol), Margin = new Thickness(0, 0, 0, 12) };
+            panel.Children.Add(sepA);
+
+            var bar = new WrapPanel { Margin = new Thickness(0, 0, 0, 10) };
+            var bTest = Ui.MkButton("保存并测试连接", false);
+            bTest.Margin = new Thickness(0, 0, 8, 0);
+            bTest.Click += delegate { AiTest(); };
+            bar.Children.Add(bTest);
+            var bRun = Ui.MkButton("开始分类", true);
+            bRun.Margin = new Thickness(0, 0, 8, 0);
+            bRun.Click += delegate { AiRun(); };
+            bar.Children.Add(bRun);
+            var bClr = Ui.MkButton("清空日志", false);
+            bClr.Click += delegate { if (tbAiLog != null) tbAiLog.Clear(); };
+            bar.Children.Add(bClr);
+            var bRul = Ui.MkButton("清空分类规则", false);
+            bRul.Margin = new Thickness(8, 0, 0, 0);
+            bRul.Click += delegate { MetaRules.Clear(); AiSay("已清空本地分类规则，下次分类会重新调用接口。"); };
+            bar.Children.Add(bRul);
+            panel.Children.Add(bar);
+
+            tbAiLog = new TextBox
+            {
+                IsReadOnly = true, AcceptsReturn = true, Height = 170,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                Background = new SolidColorBrush(Ui.CardCol), Foreground = new SolidColorBrush(Ui.SubCol),
+                BorderThickness = new Thickness(0), Padding = new Thickness(10), FontSize = 12
+            };
+            panel.Children.Add(tbAiLog);
+
+            cbAi.SelectionChanged += delegate { LoadAiProvider(cbAi.SelectedItem as string); };
+            LoadAiProvider(cbAi.SelectedItem as string);
+            return panel;
+        }
+
         FrameworkElement BuildWheelPage()
         {
             var panel = new DockPanel();
@@ -3587,17 +5016,28 @@ Dispatcher.BeginInvoke(new Action(delegate
             bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             bar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             bar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            var left = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
-            var bAuto = Ui.MkButton("自动收录文件夹…", true);
+            bar.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            bar.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            var left = new WrapPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            var bAuto = Ui.MkButton("收录文件夹", true);
             bAuto.Margin = new Thickness(0, 0, 8, 0);
-            var bFile = Ui.MkButton("添加文件…", false);
+            var bFile = Ui.MkButton("添加文件", false);
             bFile.Margin = new Thickness(0, 0, 8, 0);
-            var bDir = Ui.MkButton("添加文件夹…", false);
+            var bDir = Ui.MkButton("添加文件夹", false);
             bDir.Margin = new Thickness(0, 0, 8, 0);
             var bDel = Ui.MkButton("移除", false);
             bDel.Margin = new Thickness(0, 0, 8, 0);
-            var bRel = Ui.MkButton("重新扫描", false);
+            var bRel = Ui.MkButton("重扫", false);
+            bRel.Margin = new Thickness(0, 0, 8, 0);
+            var bPin = Ui.MkButton("置顶", false);
+            bPin.Margin = new Thickness(0, 0, 8, 0);
+            var bHide = Ui.MkButton("隐藏", false);
+            bHide.Margin = new Thickness(0, 0, 8, 0);
             left.Children.Add(bAuto); left.Children.Add(bFile); left.Children.Add(bDir); left.Children.Add(bDel); left.Children.Add(bRel);
+
+            left.Children.Add(bPin); left.Children.Add(bHide);
+            bPin.Click += delegate { TogglePin(); };
+            bHide.Click += delegate { ToggleHide(); };
 
             tbSearch = new TextBox
             {
@@ -3629,9 +5069,15 @@ Dispatcher.BeginInvoke(new Action(delegate
             searchInner.Children.Add(tbSearch);
             searchWrap.Child = searchInner;
             DockPanel.SetDock(searchWrap, Dock.Right);
-            Grid.SetColumn(searchWrap, 2);
+            Grid.SetRow(searchWrap, 1);
+            Grid.SetColumn(searchWrap, 0);
+            Grid.SetColumnSpan(searchWrap, 3);
+            searchWrap.Margin = new Thickness(0, 8, 0, 0);
             bar.Children.Add(searchWrap);
+            Grid.SetRow(left, 0);
             Grid.SetColumn(left, 0);
+            Grid.SetColumnSpan(left, 3);
+            left.Margin = new Thickness(0);
             bar.Children.Add(left);
             DockPanel.SetDock(bar, Dock.Top);
             panel.Children.Add(bar);
@@ -3672,6 +5118,18 @@ Dispatcher.BeginInvoke(new Action(delegate
             ptpl.VisualTree = pfef;
             pathCol.CellTemplate = ptpl;
             gv.Columns.Add(pathCol);
+            var cmw = new ContextMenu();
+            var miPin = new MenuItem { Header = "置顶 / 取消置顶" };
+            miPin.Click += delegate { TogglePin(); };
+            var miUp = new MenuItem { Header = "上移" };
+            miUp.Click += delegate { MoveSel(-1); };
+            var miDown = new MenuItem { Header = "下移" };
+            miDown.Click += delegate { MoveSel(1); };
+            var miHide = new MenuItem { Header = "隐藏 / 取消隐藏" };
+            miHide.Click += delegate { ToggleHide(); };
+            cmw.Items.Add(miPin); cmw.Items.Add(miUp); cmw.Items.Add(miDown); cmw.Items.Add(miHide);
+            lvWheel.ContextMenu = cmw;
+            lvWheel.MouseDoubleClick += delegate { TogglePin(); };
             lvWheel.View = gv;
             Ui.Skin(lvWheel, gv);
             lvWheel.BorderThickness = new Thickness(0);
@@ -3716,6 +5174,39 @@ var cornerPatch = new System.Windows.Shapes.Rectangle
             return panel;
         }
 
+        WheelRow SelRow() { return lvWheel == null ? null : (lvWheel.SelectedItem as WheelRow); }
+
+        void OpenAi()
+        {
+            var w = new AiWindow();
+            w.ShowDialog();
+            if (w.Changed) { Changed = true; ReloadWheel(); }
+        }
+
+        void TogglePin()
+        {
+            var r = SelRow();
+            if (r == null) { tipWheel.Text = "先在列表里选中一项"; return; }
+            Meta.Update(r.Path, delegate (MetaEntry e) { e.Pin = !e.Pin; });
+            Changed = true; ReloadWheel();
+        }
+
+        void ToggleHide()
+        {
+            var r = SelRow();
+            if (r == null) { tipWheel.Text = "先在列表里选中一项"; return; }
+            Meta.Update(r.Path, delegate (MetaEntry e) { e.Hidden = !e.Hidden; });
+            Changed = true; ReloadWheel();
+        }
+
+        void MoveSel(int d)
+        {
+            var r = SelRow();
+            if (r == null) { tipWheel.Text = "先在列表里选中一项"; return; }
+            Meta.Update(r.Path, delegate (MetaEntry e) { e.Order += d; });
+            Changed = true; ReloadWheel();
+        }
+
         public void ReloadWheel()
         {
             try
@@ -3724,11 +5215,12 @@ var cornerPatch = new System.Windows.Shapes.Rectangle
                 var custom = Scanner.LoadCustom();
                 foreach (var a in Scanner.FromDesktop())
                 {
+                    var me = Meta.Get(a.Path);
                     bool isDir = Directory.Exists(a.Path);
                     bool isCustom = custom.Exists(delegate (AppEntry c) { return string.Equals(c.Path, a.Path, StringComparison.OrdinalIgnoreCase); });
                     wheelRows.Add(new WheelRow
                     {
-                        Name = a.Name,
+                        Name = (me.Pin ? "★ " : "") + (me.Hidden ? "[已隐藏] " : "") + a.Name,
                         Path = a.Path,
                         Kind = isDir ? "文件夹" : (a.Path.ToLowerInvariant().EndsWith(".exe") ? "应用" : "文件"),
                         Source = isCustom ? "手动添加" : "桌面快捷方式"
@@ -4041,8 +5533,15 @@ var cornerPatch = new System.Windows.Shapes.Rectangle
             okB.Click += (s, e) =>
             {
                 if (string.IsNullOrWhiteSpace(tbName.Text) || string.IsNullOrWhiteSpace(tbPath.Text)) return;
+                string p0 = tbPath.Text.Trim().Trim('"');
+                if (!File.Exists(p0) && !Directory.Exists(p0))
+                {
+                    // 加了也启动不了，直接拦下（原来只判非空，用户会以为加成功了）
+                    MessageBox.Show("这个路径不存在：\n" + p0, "轮盘启动器", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
                 ResultName = tbName.Text.Trim();
-                ResultPath = tbPath.Text.Trim();
+                ResultPath = p0;
                 ResultArgs = tbArgs.Text.Trim();
                 DialogResult = true;
             };
@@ -4072,6 +5571,7 @@ class WheelApp : Application
         WF.NotifyIcon tray;
         bool startGameTab;
         bool startLookTab;
+        bool startAiTab;
 
         static System.Drawing.Icon LoadExeIcon()
         {
@@ -4100,7 +5600,7 @@ class WheelApp : Application
         static System.Threading.EventWaitHandle showEvent;
         static System.Threading.EventWaitHandle quitEvent;
         System.Windows.Interop.HwndSource hkSrc;
-        const int HK_QUICK_A = 0xB10, HK_QUICK_B = 0xB11, HK_ESC = 0xB12;
+        const int HK_QUICK_A = 0xB10, HK_QUICK_B = 0xB11, HK_ESC = 0xB12, HK_PANIC = 0xB15;
         int lastHotkeyTick;
         public static Action<int> HotkeyFire;
         public static System.Windows.Threading.Dispatcher UiDispatcher;
@@ -4118,6 +5618,57 @@ class WheelApp : Application
         {
             base.OnStartup(e);
             MouseHook.AcceptInjected = e.Args.Contains("--accept-injected");
+            // 调试口：--gametest=<pid> 直接判定某进程是不是游戏（不看前台），用于验证商店/加速器排除规则
+            foreach (var ga in e.Args)
+            {
+                if (ga == null) continue;
+                if (ga.StartsWith("--gametest=", StringComparison.OrdinalIgnoreCase))
+                {
+                    int gp;
+                    if (int.TryParse(ga.Substring("--gametest=".Length), out gp)) GameWatch.TestPid(gp);
+                }
+            }
+            // 调试口（无界面）：只跑盘根目录扫描 + 分类，日志里能看到候选与结果
+            if (e.Args.Contains("--aidrives"))
+            {
+                var prov0 = AiStore.Current();
+                var cand = new List<AppEntry>();
+                foreach (var a in Scanner.DriveFolders()) if ((Meta.Get(a.Path).Cat ?? "") == "") cand.Add(a);
+                Log.W("aidrives candidates=" + cand.Count + " provider=" + prov0.Name + " model=" + prov0.Model);
+                System.Threading.ThreadPool.QueueUserWorkItem(delegate
+                {
+                    int tok;
+                    int ok = AiClassify.Run(prov0, cand, delegate (string s) { Log.W("aidrives " + s); }, out tok);
+                    Log.W("aidrives done ok=" + ok + " tokens=" + tok);
+                });
+            }
+            if (e.Args.Contains("--aicheck"))
+            {
+                var prov = AiStore.Current();
+                Log.W("aicheck provider=" + prov.Name + " model=" + prov.Model);
+                string msg; int spent0;
+                bool ok = AiClassify.Test(prov, out msg, out spent0);
+                Log.W("aicheck test=" + ok + " msg=" + msg + " spent=" + spent0);
+                var items = Scanner.FromDesktop();
+                Log.W("aicheck items=" + items.Count);
+                int total;
+                int got = AiClassify.Run(prov, items, delegate (string s) { Log.W("aicheck " + s); }, out total);
+                Log.W("aicheck done got=" + got + " tokens=" + total);
+                Shutdown(0);
+                return;
+            }
+            if (e.Args.Contains("--airules"))
+            {
+                int learn = 0;
+                foreach (var a in Scanner.FromDesktop())
+                {
+                    string c0 = Meta.Get(a.Path).Cat ?? "";
+                    if (c0.Length > 0 && MetaRules.Learn(a.Path, c0)) learn++;
+                }
+                Log.W("airules seeded=" + learn + " total=" + MetaRules.Count);
+                Shutdown(0);
+                return;
+            }
             if (e.Args.Contains("--selftest")) { int rc = SelfTest.Run(); Shutdown(rc); return; }
             foreach (string ga in e.Args)
             {
@@ -4153,11 +5704,30 @@ class WheelApp : Application
             quitEvent = new System.Threading.EventWaitHandle(false, System.Threading.EventResetMode.AutoReset, instName + ".quit");
             if (!created)
             {
-                Log.W("another instance running, signal show and exit");
-                try { showEvent.Set(); } catch { }
-            try { System.IO.File.WriteAllText(showReqFile, "1"); } catch { }
-                Shutdown();
-                return;
+                // 提权重启：旧实例已经 Shutdown，但互斥体可能还没释放。
+                // 必须在这里等它真正退出再抢，否则新实例会判定“已在运行”并自杀，两个都退，程序直接消失。
+                bool takeover = false;
+                foreach (var ga0 in e.Args) if (string.Equals(ga0, "--elevated-restart", StringComparison.OrdinalIgnoreCase)) takeover = true;
+                if (takeover)
+                {
+                    Log.W("elevated handover: waiting for old instance to exit");
+                    for (int i = 0; i < 50; i++)
+                    {
+                        try { appMutex.Dispose(); } catch { }
+                        System.Threading.Thread.Sleep(200);
+                        appMutex = new System.Threading.Mutex(true, instName, out created);
+                        if (created) break;
+                    }
+                    if (created) Log.W("elevated handover: mutex acquired");
+                }
+                if (!created)
+                {
+                    Log.W("another instance running, signal show and exit");
+                    try { showEvent.Set(); } catch { }
+                    try { System.IO.File.WriteAllText(showReqFile, "1"); } catch { }
+                    Shutdown();
+                    return;
+                }
             }
             var listen = new System.Threading.Thread(delegate ()
             {
@@ -4185,9 +5755,21 @@ class WheelApp : Application
             }
             apps = Scanner.FromDesktop();
 
+            try
+            {
+                int routed0 = 0;
+                foreach (var pa in apps)
+                {
+                    if ((Meta.Get(pa.Path).Cat ?? "") == "game") { GameList.Add(pa.Path); routed0++; }
+                }
+                if (routed0 > 0) Log.W("auto-route games=" + routed0);
+            }
+            catch (Exception exg) { Log.W("route games failed: " + exg.Message); }
+
             hook = new MouseHook();
             hook.SideDown += OnDown;
             hook.SideUp += OnUp;
+            MouseHook.SideReset = delegate { pressed = false; dragged = false; hotkeyWheel = false; };
             hook.Move += OnMove;
             var tick = new System.Windows.Threading.DispatcherTimer(System.Windows.Threading.DispatcherPriority.Input);
             tick.Interval = TimeSpan.FromMilliseconds(25);
@@ -4197,7 +5779,23 @@ class WheelApp : Application
             wd.Interval = TimeSpan.FromMilliseconds(300);
             wd.Tick += delegate
             {
-                if (wheel != null && (DateTime.Now - lastAct).TotalSeconds > 30) { Log.W("watchdog close (idle)"); CloseWheel(); }
+                if ((wheel != null || grid != null) && (DateTime.Now - lastAct).TotalSeconds > 30) { Log.W("watchdog close (idle)"); CloseWheel(); }
+                if (MouseHook.RectShown && wheel == null && grid == null) { Log.W("watchdog clear stale rect"); MouseHook.SetWheelRect(false, 0, 0, 0, 0); }
+                // 幽灵轮盘清理：wheel 已置空但仍有轮盘窗口活着（Close 失败被吞），1 秒内自动收掉
+                if (wheel == null && WheelWindow.Live.Count > 0) { Log.W("watchdog sweep orphan wheels=" + WheelWindow.Live.Count); WheelWindow.KillAll(); }
+                if (grid == null && GridWindow.Live.Count > 0) { Log.W("watchdog sweep orphan grids=" + GridWindow.Live.Count); GridWindow.KillAll(); }
+                // 窗口引用还在、但已经不可见：它的矩形会继续吞左键（Steam 里“左键失灵”就是这种），立刻收掉
+                if (wheel != null && !wheel.IsVisible) { Log.W("watchdog close (invisible wheel)"); CloseWheel(); }
+                if (grid != null && !grid.IsVisible) { Log.W("watchdog close (invisible grid)"); CloseWheel(); }
+                // 吞键标记卡住（配对抬起丢失）：超时强制复位，否则后续正常左键会被一直吞掉
+                if (MouseHook.SwallowStale) { MouseHook.ResetSwallow(); Log.W("swallow stale reset"); }
+                // 侧键状态机卡死兜底：抬起事件被 UIPI/前台切换吞掉时，pressed 会永远为真，
+                // 而 25ms 的 OnMove 会在 650ms 后判定「长按已到」→ 没人按键也弹盘。
+                if (pressed && wheel == null && grid == null && (DateTime.Now - pressAt).TotalSeconds > Math.Max(8.0, LongPressMs / 1000.0 * 4))
+                {
+                    pressed = false; dragged = false; hotkeyWheel = false;
+                    Log.W("side state stale reset");
+                }
             };
             wd.Start();
             MouseHook.Quick += delegate(int b) { hotkeyWheel = true; Native.POINT cp; Native.GetCursorPos(out cp); ShowWheel(b, cp.x, cp.y, cp.x, cp.y); };
@@ -4265,10 +5863,18 @@ class WheelApp : Application
 
             GameWatch.Changed = delegate (bool on)
             {
+                // 回调来自 GameWatch 的扫描线程，必须切回 UI 线程再做窗口/托盘操作，
+                // 否则 CloseWheel 里 wheel.Close() 会抛“调用线程无法访问此对象”，吞掉后留下幽灵窗口
                 try
                 {
-                    if (on) CloseWheel();
-                    if (tray != null) tray.Text = on ? "轮盘启动器（游戏中已暂停）" : "轮盘启动器";
+                    Action apply = delegate
+                    {
+                        try { if (on) CloseWheel(); } catch { }
+                        try { if (tray != null) tray.Text = on ? "轮盘启动器（游戏中已暂停）" : "轮盘启动器"; } catch { }
+                    };
+                    var d = Dispatcher;
+                    if (d == null || d.CheckAccess()) apply();
+                    else d.BeginInvoke(new Action(delegate { try { apply(); } catch { } }));
                 }
                 catch { }
             };
@@ -4293,11 +5899,26 @@ class WheelApp : Application
             snd.CheckedChanged += (s, a) => { Settings.SoundOn = snd.Checked; Log.W("sound=" + snd.Checked); };
             menu.Items.Add(snd);
             menu.Items.Add("测试音效", null, (s, a) => Click.Test());
-            var auto = new WF.ToolStripMenuItem("开机自启") { CheckOnClick = true, Checked = IsAutoStart() };
-            auto.CheckedChanged += (s, a) => SetAutoStart(auto.Checked);
-            menu.Items.Add(auto);
-            var logonTask = new WF.ToolStripMenuItem("开机自动启动（管理员权限，无 UAC 提示）") { CheckOnClick = true, Checked = TaskInstalled() };
-            logonTask.CheckedChanged += (s, a) => { ToggleLogonTask(logonTask.Checked); tray.ShowBalloonTip(1500, "轮盘启动器", logonTask.Checked ? "已设置开机自动启动" : "已取消开机自动启动", WF.ToolTipIcon.Info); };
+            // 旧的「HKCU Run 开机自启」会以普通权限启动，热键盖不住高权限窗口；统一改走计划任务（/RL HIGHEST）。
+            // 这里做一次迁移：发现注册表里有旧项就删掉，避免两份自启互相打架。
+            // 只有计划任务真的装成了，才删旧的 HKCU Run 项；否则等于把用户唯一有效的自启干掉
+            if (IsAutoStart())
+            {
+                if (TaskInstalled()) { SetAutoStart(false); Log.W("migrate: removed HKCU Run autostart, use logon task"); }
+                else Log.W("migrate: keep HKCU Run autostart (logon task missing)");
+            }
+            var logonTask = new WF.ToolStripMenuItem("开机自启动（管理员权限，无 UAC 提示）") { CheckOnClick = true, Checked = TaskInstalled() };
+            bool syncing = false;
+            logonTask.CheckedChanged += (s, a) =>
+            {
+                if (syncing) return;
+                bool want = logonTask.Checked;
+                bool ok = ToggleLogonTask(want);
+                if (!ok) { syncing = true; logonTask.Checked = !want; syncing = false; }
+                tray.ShowBalloonTip(1500, "轮盘启动器",
+                    ok ? (want ? "已设置开机自动启动" : "已取消开机自动启动") : "设置失败，详见日志",
+                    ok ? WF.ToolTipIcon.Info : WF.ToolTipIcon.Warning);
+            };
             menu.Items.Add(logonTask);
             if (!WheelApp.IsElevated)
                 menu.Items.Add("以管理员身份重启（加速器/管理员程序下也能呼出）…", null, (s, a) => RestartElevated());
@@ -4317,7 +5938,7 @@ class WheelApp : Application
             if (e.Args.Contains("--ticktest")) { Log.W("ticktest"); Click.Test(); }
             if (e.Args.Contains("--probe2")) { Dispatcher.BeginInvoke(new Action(() => { ShowWheel(0, 1280, 700, 1280, 700); DispatcherTimerOneShot(700, delegate { if (wheel != null) wheel.Probe((int)Math.Round(scale)); }); })); }
             if (e.Args.Contains("--addtest")) { Dispatcher.BeginInvoke(new Action(() => OpenAddDialog())); }
-            if (e.Args.Contains("--wheelsettings")) { startGameTab = e.Args.Contains("--gametab"); startLookTab = e.Args.Contains("--looktab"); Dispatcher.BeginInvoke(new Action(() => OpenWheelSettings())); }
+            if (e.Args.Contains("--wheelsettings")) { startGameTab = e.Args.Contains("--gametab"); startLookTab = e.Args.Contains("--looktab"); startAiTab = e.Args.Contains("--aitab"); Dispatcher.BeginInvoke(new Action(() => OpenWheelSettings())); }
             if (e.Args.Contains("--autofolders")) { Dispatcher.BeginInvoke(new Action(delegate { var w = new AutoFoldersWindow(); w.ShowDialog(); })); }
             if (e.Args.Contains("--shot")) WheelWindow.ShotMode = true;
             if (e.Args.Contains("--show1")) { Dispatcher.BeginInvoke(new Action(() => { var w = WF.Screen.PrimaryScreen.WorkingArea; ShowWheel(1, w.Width / 2, w.Height / 2, w.Width / 2 - 200, w.Height / 2);
@@ -4349,7 +5970,14 @@ class WheelApp : Application
                 {
                     // 启动瞬间常与旧实例/其它程序抢注册，失败就每 3 秒重试，直到拿到为止
                     var hkRetry = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
-                    hkRetry.Tick += delegate { TryRegisterHotkeys(); if (hotkeysOk) hkRetry.Stop(); };
+                    int hkTry = 0;
+                    hkRetry.Tick += delegate
+                    {
+                        hkTry++;
+                        TryRegisterHotkeys();
+                        // 重试上限：一直被别的程序占着就别无限空转（每轮都会先注销再注册，反而抢别人）
+                        if (hotkeysOk || hkTry >= 20) { hkRetry.Stop(); if (!hotkeysOk) Log.W("hotkey retry gave up after " + hkTry + " tries"); }
+                    };
                     hkRetry.Start();
                 }
             }
@@ -4357,13 +5985,21 @@ class WheelApp : Application
 
             if (e.Args.Contains("--elevated-restart"))
             {
-                Log.W("elevated restart handover");
-                System.Threading.Thread.Sleep(1800);
-                Log.W("elevated restart continuing");
+                // 互斥体已在上面用重试抢到（不再在这里 Sleep 拖住 UI 线程）
+                Log.W("elevated restart handover done");
             }
         }
 
+        static bool soundOpen;
         public void OpenSettings()
+        {
+            if (soundOpen) { Log.W("sound settings already open, ignore"); return; }
+            soundOpen = true;
+            try { OpenSettingsCore(); }
+            finally { soundOpen = false; }
+        }
+
+        void OpenSettingsCore()
         {
             var fg = new SolidColorBrush(Ui.InkCol);
             var dim = new SolidColorBrush(Ui.SubCol);
@@ -4598,7 +6234,12 @@ class WheelApp : Application
         {
             if (!pressed) return;
             if (wheel != null && hotkeyWheel) { pressed = false; Log.W("side release closes hotkey wheel"); CloseWheel(); return; }
-            if (wheel != null && btn != downBtn) return;   // 另一个侧键的抬起不参与提交
+            // 另一个侧键的抬起：只忽略，**绝不能复位 pressed**——
+            // 轮盘以按下点为圆心，用户可能先松开抬起的那颗键、再松开主键；
+            // 若这里把 pressed 清掉，主键抬起会被 `if (!pressed) return;` 吞掉，
+            // 结果就是"轮盘收不起来、松手不启动"。卡死状态由看门狗的
+            // side state stale reset 兜底（见 Watchdog）。
+            if (wheel != null && btn != downBtn) return;
             if (grid != null)
             {
                 pressed = false;
@@ -4660,23 +6301,47 @@ class WheelApp : Application
             catch (Exception ex) { Log.W("OpenAddDialog failed: " + ex.Message); }
         }
 
+        static bool settingsOpen;
         void OpenWheelSettings()
         {
+            if (settingsOpen)
+            {
+                // 设置窗已经开着：再点齿轮应该是"把它拿到前面来"，而不是什么都不发生
+                var cur = settingsWin;
+                if (cur != null)
+                {
+                    try
+                    {
+                        if (cur.WindowState == WindowState.Minimized) cur.WindowState = WindowState.Normal;
+                        cur.Topmost = true; cur.Topmost = false;
+                        cur.Activate(); cur.Focus();
+                        Log.W("settings already open -> activate");
+                    }
+                    catch (Exception exa) { Log.W("settings activate failed: " + exa.Message); }
+                }
+                else Log.W("settings already open, ignore");
+                return;
+            }
+            settingsOpen = true;
             try
             {
                 for (int guard = 0; guard < 4; guard++)
                 {
-                    var w = new WheelSettingsWindow(startLookTab ? 2 : (startGameTab ? 1 : 0));
+                    var w = new WheelSettingsWindow(startAiTab ? 3 : (startLookTab ? 2 : (startGameTab ? 1 : 0)));
+                    settingsWin = w;
                     w.Reloaded = delegate { apps = Scanner.FromDesktop(); };
                     w.ShowDialog();
                     if (w.Changed) apps = Scanner.FromDesktop();
                     Log.W("wheel settings closed changed=" + w.Changed + " reopen=" + w.Reopen + " apps=" + apps.Count);
                     if (!w.Reopen) break;   // 切换主题后重建窗口，用新配色重开
-                    startGameTab = false; startLookTab = false;
+                    startGameTab = false; startLookTab = false; startAiTab = false;
                 }
             }
             catch (Exception ex) { Log.W("OpenWheelSettings failed: " + ex.Message); }
+            finally { settingsOpen = false; settingsWin = null; }
         }
+
+        static WheelSettingsWindow settingsWin;
 
         bool hotkeysOk;
         void TryRegisterHotkeys()
@@ -4694,8 +6359,9 @@ class WheelApp : Application
             bool a2 = Native.RegisterHotKey(hkSrc.Handle, HK_QUICK_B, Native.MOD_CONTROL | Native.MOD_ALT | Native.MOD_NOREPEAT, 0x42);
             bool a3 = Native.RegisterHotKey(hkSrc.Handle, 0xB13, Native.MOD_NOREPEAT, 0x76);
             bool a4 = Native.RegisterHotKey(hkSrc.Handle, 0xB14, Native.MOD_NOREPEAT, 0x77);
+            bool a5 = Native.RegisterHotKey(hkSrc.Handle, HK_PANIC, Native.MOD_CONTROL | Native.MOD_ALT | 0x0004u | Native.MOD_NOREPEAT, 0x79);
             hotkeysOk = a1 && a2 && a3 && a4;
-            Log.W("hotkeys ctrl+alt+A=" + a1 + " ctrl+alt+B=" + a2 + " F7=" + a3 + " F8=" + a4);
+            Log.W("hotkeys ctrl+alt+A=" + a1 + " ctrl+alt+B=" + a2 + " F7=" + a3 + " F8=" + a4 + " panic=" + a5);
         }
 
         IntPtr HotkeyHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
@@ -4707,7 +6373,18 @@ class WheelApp : Application
                 else if (id == HK_QUICK_B) { QuickWheel(2); handled = true; }
                 else if (id == 0xB13) { if ((Native.GetAsyncKeyState(0x76) & 0x8000) == 0 || wheel == null) QuickWheel(1); handled = true; }
                 else if (id == 0xB14) { if ((Native.GetAsyncKeyState(0x77) & 0x8000) == 0 || wheel == null) QuickWheel(2); handled = true; }
+                else if (id == HK_PANIC) { Log.W("panic: wheel=" + (wheel != null) + " grid=" + (grid != null) + " live=" + WheelWindow.Live.Count + " rect=" + MouseHook.RectShown); CloseWheel(); WheelWindow.KillAll(); MouseHook.SetWheelRect(false, 0, 0, 0, 0); handled = true; }
                 else if (id == HK_ESC) { CloseWheel(); handled = true; }
+            }
+            // 显示器/电源状态变化（合盖、分辨率变化、显示器热插拔、DPI 变化）：
+            // 分层窗口在这种事件后可能“内容看不见、但矩形仍在吞鼠标”，表现为左键失灵。
+            // 收到就一律清空所有轮盘与吞键矩形，宁可让它重新呼出。
+            if (msg == 0x007E || msg == 0x02E0 || msg == 0x02E2 || msg == 0x0218)
+            {
+                Log.W("display/power change msg=0x" + msg.ToString("X") + " -> clear wheels wheel=" + (wheel != null) + " rect=" + MouseHook.RectShown);
+                CloseWheel();
+                WheelWindow.KillAll();
+                MouseHook.SetWheelRect(false, 0, 0, 0, 0);
             }
             return IntPtr.Zero;
         }
@@ -4729,7 +6406,9 @@ class WheelApp : Application
         {
             try
             {
-                if (quitEvent != null) { try { quitEvent.Set(); } catch { } }
+                // 不能提前 quitEvent.Set()：用户一旦在 UAC 上点“否”，Process.Start 抛异常，
+                // 我们却已经把退出信号发出去了，结果就是旧实例自己退掉、新实例也没起来 → 程序凭空消失。
+                // 退出信号由提权实例在 --elevated-restart 流程里发出。
                 var psi = new System.Diagnostics.ProcessStartInfo(WF.Application.ExecutablePath, "--elevated-restart");
                 psi.UseShellExecute = true;
                 psi.Verb = "runas";
@@ -4750,7 +6429,7 @@ class WheelApp : Application
             catch { return false; }
         }
 
-        void ToggleLogonTask(bool on)
+        bool ToggleLogonTask(bool on)
         {
             try
             {
@@ -4760,9 +6439,18 @@ class WheelApp : Application
                     : "/Delete /F /TN WheelLauncherAutostart";
                 var p = new System.Diagnostics.ProcessStartInfo("schtasks.exe", args);
                 p.UseShellExecute = false; p.CreateNoWindow = true; p.RedirectStandardOutput = true; p.RedirectStandardError = true;
-                using (var pr = System.Diagnostics.Process.Start(p)) { pr.WaitForExit(8000); Log.W("logon task " + on + " exit=" + pr.ExitCode); }
+                using (var pr = System.Diagnostics.Process.Start(p))
+                {
+                    string so = pr.StandardOutput.ReadToEnd();
+                    string se = pr.StandardError.ReadToEnd();
+                    pr.WaitForExit(8000);
+                    bool okNow = TaskInstalled();
+                    Log.W("logon task " + on + " exit=" + pr.ExitCode + " installed=" + okNow +
+                          (pr.ExitCode == 0 ? "" : " out=" + so.Trim() + " err=" + se.Trim()));
+                    return okNow == on;
+                }
             }
-            catch (Exception ex) { Log.W("logon task failed: " + ex.Message); }
+            catch (Exception ex) { Log.W("logon task failed: " + ex.Message); return false; }
         }
 
         void OnEscape()
@@ -4774,7 +6462,10 @@ class WheelApp : Application
         List<List<Ring>> BuildWheelPages(List<AppEntry> ordered, double hub, double budget)
         {
             var groups = new List<List<AppEntry>>();
-            foreach (var g in ordered.GroupBy(a => a.Initial == '#' ? '[' : a.Initial).OrderBy(g2 => g2.Key))
+            var pinnedItems = ordered.Where(a => Meta.Get(a.Path).Pin).ToList();
+            var restItems = ordered.Where(a => !Meta.Get(a.Path).Pin).ToList();
+            if (pinnedItems.Count > 0) groups.Add(pinnedItems);
+            foreach (var g in restItems.GroupBy(a => a.Initial == '#' ? '[' : a.Initial).OrderBy(g2 => g2.Key))
             {
                 var members = g.ToList();
                 if (groups.Count > 0 && members.Count <= 2 && groups[groups.Count - 1].Count <= 2)
@@ -4852,7 +6543,8 @@ class WheelApp : Application
 
         string HintText()
         {
-            string h0 = wBtn == 1 ? "A-M" : (wBtn == 2 ? "N-Z" : "全部");
+            bool byCat = Settings.WheelMode == 1;
+            string h0 = wBtn == 1 ? (byCat ? "应用" : "A-M") : (wBtn == 2 ? (byCat ? "游戏" : "N-Z") : "全部");
             if (wPages != null && wPages.Count > 1) h0 += "  " + (wPage + 1) + "/" + wPages.Count;
             return h0;
         }
@@ -4929,21 +6621,28 @@ class WheelApp : Application
 
                 List<AppEntry> sub;
                 string tag;
-                if (btn == 1) { sub = apps.Where(a => a.Initial <= 'M').ToList(); tag = "A-M"; }
+                if (Settings.WheelMode == 1)
+                {
+                    if (btn == 1) { sub = apps.Where(a => Meta.Get(a.Path).Set != "game").ToList(); tag = "APP"; }
+                    else if (btn == 2) { sub = apps.Where(a => Meta.Get(a.Path).Set == "game").ToList(); tag = "GAME"; }
+                    else { sub = apps; tag = "ALL"; }
+                }
+                else if (btn == 1) { sub = apps.Where(a => a.Initial <= 'M').ToList(); tag = "A-M"; }
                 else if (btn == 2) { sub = apps.Where(a => a.Initial >= 'N' || a.Initial == '#').ToList(); tag = "N-Z"; }
                 else { sub = apps; tag = "ALL"; }
                 if (sub.Count == 0) { Log.W("empty subset " + tag); return; }
+                var ordered = Meta.Apply(sub);
 
-                var ordered = sub.OrderBy(a => a.Initial == '#' ? '[' : a.Initial).ThenBy(a => a.Name, StringComparer.CurrentCulture).ToList();
-
+                if (ordered.Count == 0) { Log.W("all hidden " + tag); return; }
+                CloseWheel();                       // 必须在建页之前关旧盘：CloseWheel 会清空 wPages
                 wPages = BuildWheelPages(ordered, hub, budget);
                 if (wPages.Count == 0) { Log.W("no layout"); return; }
                 wPage = 0; wBtn = btn; wTag = tag;
-                CloseWheel();
                 System.Threading.ThreadPool.QueueUserWorkItem(delegate { Click.Warm(); });
                 wheel = new WheelWindow();
+                WheelWindow.Active = wheel;
                 var selfW = wheel;
-                wheel.Closed += delegate { if (ReferenceEquals(wheel, selfW)) wheel = null; };
+                wheel.Closed += delegate { if (WheelWindow.Active == selfW) WheelWindow.Active = null; if (ReferenceEquals(wheel, selfW)) { wheel = null; MouseHook.SetWheelRect(false, 0, 0, 0, 0); Log.W("wheel closed externally"); } };
             wheel.ResetReach();
                 wheel.Pick = delegate (AppEntry a) { CloseWheel(); if (a != null) Launcher.Run(a); else Log.W("left click blank -> close wheel"); };
                 wheel.HubPick = delegate { CloseWheel(); OpenWheelSettings(); };
@@ -4970,16 +6669,24 @@ class WheelApp : Application
             {
                 scale = GetScaleAt(sx, sy);
                 List<AppEntry> sub; string title;
-                if (btn == 1) { sub = apps.Where(a => a.Initial <= 'M').ToList(); title = "A - M"; }
+                if (Settings.WheelMode == 1)
+                {
+                    if (btn == 1) { sub = apps.Where(a => Meta.Get(a.Path).Set != "game").ToList(); title = "应用"; }
+                    else if (btn == 2) { sub = apps.Where(a => Meta.Get(a.Path).Set == "game").ToList(); title = "游戏"; }
+                    else { sub = apps; title = "全部"; }
+                }
+                else if (btn == 1) { sub = apps.Where(a => a.Initial <= 'M').ToList(); title = "A - M"; }
                 else if (btn == 2) { sub = apps.Where(a => a.Initial >= 'N' || a.Initial == '#').ToList(); title = "N - Z"; }
                 else { sub = apps; title = "全部应用"; }
                 if (sub.Count == 0) { Log.W("empty subset grid"); return; }
-                var ordered = sub.OrderBy(a => a.Initial == '#' ? '[' : a.Initial).ThenBy(a => a.Name, StringComparer.CurrentCulture).ToList();
+                var ordered = Meta.Apply(sub);
                 CloseWheel();
                 System.Threading.ThreadPool.QueueUserWorkItem(delegate { Click.Warm(); });
+                if (ordered.Count == 0) { Log.W("all hidden grid"); return; }
                 grid = new GridWindow(title);
+                GridWindow.Active = grid;
                 var selfG = grid;
-                grid.Closed += delegate { if (ReferenceEquals(grid, selfG)) grid = null; };
+                grid.Closed += delegate { if (ReferenceEquals(grid, selfG)) { if (GridWindow.Active == selfG) GridWindow.Active = null; grid = null; MouseHook.SetWheelRect(false, 0, 0, 0, 0); Log.W("grid closed externally"); } };
                 var scr = WF.Screen.FromPoint(new System.Drawing.Point(sx, sy)).WorkingArea;
                 grid.Build(ordered, scr.Width / scale * 0.84, scr.Height / scale * 0.80);
                 grid.PlaceAt(sx, sy, scale);
@@ -5081,7 +6788,7 @@ static int Cap(double radius, double icon)
         {
             if (grid != null)
             {
-                grid.Move(dx, dy);
+                try { grid.Move(dx, dy); } catch (Exception exg) { Log.W("grid move failed: " + exg.GetType().Name + " " + exg.Message); }
                 Native.POINT kp; Native.GetCursorPos(out kp); kbCurX = kp.x; kbCurY = kp.y; kbAt = DateTime.Now;
             kbGearHold = grid.HubSelected; kbSel = grid.Hovered; stickOn = false;
                 lastAct = DateTime.Now;
@@ -5154,23 +6861,45 @@ static int Cap(double radius, double icon)
         }
         void CloseWheel()
         {
+            // 任何线程调用都安全：不在 UI 线程就转过去，避免跨线程操作窗口抛异常后留下幽灵窗口
+            var d0 = Dispatcher;
+            if (d0 != null && !d0.CheckAccess()) { d0.BeginInvoke(new Action(delegate { try { CloseWheel(); } catch { } })); return; }
             if (hkSrc != null) { try { Native.UnregisterHotKey(hkSrc.Handle, HK_ESC); } catch { } }
-            if (grid != null) { Log.W("grid closed"); try { grid.Close(); } catch { } grid = null; }
-            if (wheel != null) Log.W("wheel closed");
+            if (grid != null)
+            {
+                Log.W("grid closed");
+                var gClose = grid;
+                try { gClose.Topmost = false; gClose.Close(); }
+                catch (Exception ex) { Log.W("grid close failed: " + ex.Message); try { gClose.Hide(); } catch { } }
+                grid = null;
+            }
+            if (GridWindow.Live.Count > 0) { Log.W("sweep orphan grids=" + GridWindow.Live.Count); GridWindow.KillAll(); }
+            GridWindow.Active = null;
+            var wClose = wheel;
+            wheel = null;
+            wPages = null;
             MouseHook.SetWheelRect(false, 0, 0, 0, 0);
             hotkeyWheel = false;
-            if (wheel != null)
+            if (wClose != null)
             {
-                try { wheel.Close(); } catch { }
-                wheel = null;
-            wPages = null;
+                Log.W("wheel closed");
+                try { wClose.Topmost = false; } catch { }
+                try { wClose.Close(); }
+                catch (Exception ex) { Log.W("wheel close failed: " + ex.Message); try { wClose.Hide(); } catch { } }
             }
+            if (WheelWindow.Live.Count > 0) { Log.W("sweep orphan wheels=" + WheelWindow.Live.Count); WheelWindow.KillAll(); }
         }
 
         protected override void OnExit(ExitEventArgs e)
         {
+            try { Log.W("=== exit ==="); Log.Drain(); } catch { }
             try { if (tray != null) { tray.Visible = false; tray.Dispose(); } } catch { }
             try { Click.Close(); } catch { }
+            try { if (hook != null) hook.Close(); } catch { }
+            try { if (hkSrc != null) { hkSrc.Dispose(); hkSrc = null; } } catch { }
+            try { if (quitEvent != null) quitEvent.Close(); } catch { }
+            try { if (showEvent != null) showEvent.Close(); } catch { }
+            try { if (appMutex != null) appMutex.ReleaseMutex(); } catch { }
             Log.W("exit");
             base.OnExit(e);
         }
