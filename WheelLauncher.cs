@@ -297,6 +297,40 @@ namespace WheelLauncher
             [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 80)] public string szTypeName;
         }
 
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        static extern IntPtr SHGetFileInfo(IntPtr pidl, IntPtr dwFileAttributes, ref SHFILEINFO psfi, uint cbFileInfo, uint uFlags);
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        static extern int SHParseDisplayName(string name, IntPtr pbc, out IntPtr ppidl, uint sfgaoIn, out uint psfgaoOut);
+        [DllImport("ole32.dll")]
+        static extern void CoTaskMemFree(IntPtr pv);
+
+        /// 取 shell 命名空间项（回收站、控制面板、此电脑…）的真实图标
+        public static ImageSource GetShellIcon(string shellName)
+        {
+            if (string.IsNullOrEmpty(shellName)) return null;
+            string key = "\u0001shell:" + shellName;
+            ImageSource src;
+            lock (CacheLock) { if (Cache.TryGetValue(key, out src) && src != null) return src; }
+            IntPtr pidl = IntPtr.Zero;
+            try
+            {
+                uint attrs;
+                if (SHParseDisplayName(shellName, IntPtr.Zero, out pidl, 0, out attrs) != 0 || pidl == IntPtr.Zero) return null;
+                var info = new SHFILEINFO();
+                IntPtr r = SHGetFileInfo(pidl, IntPtr.Zero, ref info, (uint)Marshal.SizeOf(typeof(SHFILEINFO)), 0x000000100 | 0x000000008);
+                if (r == IntPtr.Zero || info.hIcon == IntPtr.Zero) return null;
+                try
+                {
+                    var bmp = Imaging.CreateBitmapSourceFromHIcon(info.hIcon, Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions());
+                    bmp.Freeze();
+                    lock (CacheLock) { Cache[key] = bmp; }
+                    return bmp;
+                }
+                finally { DestroyIcon(info.hIcon); }
+            }
+            catch { return null; }
+            finally { if (pidl != IntPtr.Zero) CoTaskMemFree(pidl); }
+        }
         static ImageSource FromShellPath(string anyPath)
         {
             try
@@ -353,6 +387,46 @@ namespace WheelLauncher
         }
     }
 
+    /// <summary>内置系统入口：回收站、控制面板、设备管理器、网络连接等。</summary>
+    public static class ShellItems
+    {
+        class T { public string Name; public string Path; public string Args; public string IconShell; }
+
+        static readonly T[] All = new T[]
+        {
+            new T { Name = "回收站",       Path = "shell:RecycleBinFolder", IconShell = "shell:RecycleBinFolder" },
+            new T { Name = "此电脑",       Path = "shell:MyComputerFolder", IconShell = "shell:MyComputerFolder" },
+            new T { Name = "控制面板",     Path = "control.exe",            IconShell = "shell:ControlPanelFolder" },
+            new T { Name = "网络连接",     Path = "ncpa.cpl",               IconShell = @"C:\Windows\System32\ncpa.cpl" },
+            new T { Name = "设备管理器",   Path = "devmgmt.msc",            IconShell = @"C:\Windows\System32\devmgmt.msc" },
+            new T { Name = "服务",         Path = "services.msc",           IconShell = @"C:\Windows\System32\services.msc" },
+            new T { Name = "任务管理器",   Path = "taskmgr.exe" },
+            new T { Name = "注册表编辑器", Path = "regedit.exe" },
+            new T { Name = "磁盘管理",     Path = "diskmgmt.msc",           IconShell = @"C:\Windows\System32\diskmgmt.msc" },
+            new T { Name = "程序和功能",   Path = "appwiz.cpl",             IconShell = @"C:\Windows\System32\appwiz.cpl" },
+            new T { Name = "Windows 设置", Path = "ms-settings:",           IconShell = @"C:\Windows\ImmersiveControlPanel\SystemSettings.exe" },
+            new T { Name = "任务计划程序", Path = "taskschd.msc",           IconShell = @"C:\Windows\System32\taskschd.msc" },
+        };
+
+        public static bool IsShellItem(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return false;
+            foreach (var s in All) if (string.Equals(s.Path, path, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+        public static List<AppEntry> Items()
+        {
+            var list = new List<AppEntry>();
+            foreach (var s in All)
+            {
+                var e = new AppEntry { Name = s.Name, Path = s.Path, Args = s.Args ?? "", Initial = Pinyin.Get(s.Name) };
+                if (e.Initial == '#') e.Initial = 'Z';
+                e.Icon = s.IconShell != null ? Icons.GetShellIcon(s.IconShell) : Icons.Get(s.Path);
+                list.Add(e);
+            }
+            return list;
+        }
+    }
     public static class Scanner
     {
         static readonly string SelfExe = System.Diagnostics.Process.GetCurrentProcess().MainModule.FileName;
@@ -584,7 +658,17 @@ namespace WheelLauncher
                 if (!dup) list.Add(c);
             }
 
-            foreach (var e in list) e.Icon = Icons.Get(e.Path);
+            if (Settings.SystemItems)
+            {
+                foreach (var se in ShellItems.Items())
+                {
+                    bool dupS = false;
+                    foreach (var e4 in list) if (string.Equals(e4.Path, se.Path, StringComparison.OrdinalIgnoreCase)) { dupS = true; break; }
+                    if (!dupS) list.Add(se);
+                }
+            }
+
+            foreach (var e in list) if (e.Icon == null) e.Icon = Icons.Get(e.Path);
             Log.W("scanned apps=" + list.Count + " letters=" + string.Join("", list.GroupBy(a => a.Initial).OrderBy(g => g.Key == '#' ? 999 : g.Key).Select(g => g.Key.ToString()).ToArray()));
             return list.OrderBy(a => a.Initial == '#' ? 999 : a.Initial).ThenBy(a => a.Name, StringComparer.CurrentCulture).ToList();
         }
@@ -1060,45 +1144,52 @@ namespace WheelLauncher
             item.Setters.Add(new Setter(Control.TemplateProperty, System.Windows.Markup.XamlReader.Parse(rowXaml)));
             lv.ItemContainerStyle = item;
 
-            // 滚动条：默认模板是浅色系统主题（深色下发白、看不清）→ 用 XAML 模板换成调色板色
-            string thumbHex = Dark ? "#6E6880" : "#8E8898";
-            string trackHex = Dark ? "#2A2833" : "#D6D3CA";
-            string vertXaml = "<ControlTemplate xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' "
-                + "xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' TargetType='ScrollBar'>"
-                + "<Grid Width='12' Background='" + trackHex + "'>"
+            // 滚动条：默认模板是浅色系统主题（深色下发白、看不清）→ 换成调色板色
+            lv.Resources.Add(typeof(System.Windows.Controls.Primitives.ScrollBar), ScrollBarStyle(12));
+        }
+
+        // Scrollbar style: thicker track + bright thumb, used by every page scroller.
+        // width = track width in DIP (16 for settings pages, 12 for list views)
+        public static Style ScrollBarStyle(int width)
+        {
+            string thumbHex = Dark ? "#A79FD0" : "#8E8898";
+            string thumbHot = Dark ? "#D2CBEE" : "#6E6880";
+            string trackHex = Dark ? "#33303D" : "#D8D4CA";
+            int tw = Math.Max(6, width - 6);
+            string vertXaml = "<ControlTemplate xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' TargetType='ScrollBar'>"
+                + "<Grid Width='" + width + "' Background='Transparent'>"
+                + "<Border Width='" + (width - 2) + "' CornerRadius='" + ((width - 2) / 2) + "' Background='" + trackHex + "' HorizontalAlignment='Center'/>"
                 + "<Track x:Name='PART_Track' Focusable='False' Orientation='Vertical' IsDirectionReversed='True' "
-                + "Minimum='{TemplateBinding Minimum}' Maximum='{TemplateBinding Maximum}' "
-                + "Value='{TemplateBinding Value}' ViewportSize='{TemplateBinding ViewportSize}'>"
+                + "Minimum='{TemplateBinding Minimum}' Maximum='{TemplateBinding Maximum}' Value='{TemplateBinding Value}' ViewportSize='{TemplateBinding ViewportSize}'>"
                 + "<Track.DecreaseRepeatButton><RepeatButton Command='ScrollBar.PageUpCommand' Opacity='0' Focusable='False'/></Track.DecreaseRepeatButton>"
                 + "<Track.IncreaseRepeatButton><RepeatButton Command='ScrollBar.PageDownCommand' Opacity='0' Focusable='False'/></Track.IncreaseRepeatButton>"
-                + "<Track.Thumb><Thumb Width='8' Margin='2' MinHeight='24'>"
+                + "<Track.Thumb><Thumb Width='" + tw + "' MinHeight='48' HorizontalAlignment='Center'>"
                 + "<Thumb.Template><ControlTemplate TargetType='Thumb'>"
-                + "<Border CornerRadius='4' Background='" + thumbHex + "'/>"
+                + "<Border x:Name='bd' CornerRadius='" + (tw / 2) + "' Background='" + thumbHex + "'/>"
+                + "<ControlTemplate.Triggers><Trigger Property='IsMouseOver' Value='True'><Setter TargetName='bd' Property='Background' Value='" + thumbHot + "'/></Trigger></ControlTemplate.Triggers>"
                 + "</ControlTemplate></Thumb.Template></Thumb></Track.Thumb>"
                 + "</Track></Grid></ControlTemplate>";
-            string horizXaml = "<ControlTemplate xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' "
-                + "xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' TargetType='ScrollBar'>"
-                + "<Grid Height='12' Background='" + trackHex + "'>"
+            string horizXaml = "<ControlTemplate xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' TargetType='ScrollBar'>"
+                + "<Grid Height='" + width + "' Background='Transparent'>"
+                + "<Border Height='" + (width - 2) + "' CornerRadius='" + ((width - 2) / 2) + "' Background='" + trackHex + "' VerticalAlignment='Center'/>"
                 + "<Track x:Name='PART_Track' Focusable='False' Orientation='Horizontal' IsDirectionReversed='False' "
-                + "Minimum='{TemplateBinding Minimum}' Maximum='{TemplateBinding Maximum}' "
-                + "Value='{TemplateBinding Value}' ViewportSize='{TemplateBinding ViewportSize}'>"
+                + "Minimum='{TemplateBinding Minimum}' Maximum='{TemplateBinding Maximum}' Value='{TemplateBinding Value}' ViewportSize='{TemplateBinding ViewportSize}'>"
                 + "<Track.DecreaseRepeatButton><RepeatButton Command='ScrollBar.PageLeftCommand' Opacity='0' Focusable='False'/></Track.DecreaseRepeatButton>"
                 + "<Track.IncreaseRepeatButton><RepeatButton Command='ScrollBar.PageRightCommand' Opacity='0' Focusable='False'/></Track.IncreaseRepeatButton>"
-                + "<Track.Thumb><Thumb Height='8' Margin='2' MinWidth='24'>"
+                + "<Track.Thumb><Thumb Height='" + tw + "' MinWidth='48' VerticalAlignment='Center'>"
                 + "<Thumb.Template><ControlTemplate TargetType='Thumb'>"
-                + "<Border CornerRadius='4' Background='" + thumbHex + "'/>"
+                + "<Border x:Name='bd' CornerRadius='" + (tw / 2) + "' Background='" + thumbHex + "'/>"
+                + "<ControlTemplate.Triggers><Trigger Property='IsMouseOver' Value='True'><Setter TargetName='bd' Property='Background' Value='" + thumbHot + "'/></Trigger></ControlTemplate.Triggers>"
                 + "</ControlTemplate></Thumb.Template></Thumb></Track.Thumb>"
                 + "</Track></Grid></ControlTemplate>";
-            var sbStyle = new Style(typeof(System.Windows.Controls.Primitives.ScrollBar));
-            sbStyle.Setters.Add(new Setter(Control.TemplateProperty, System.Windows.Markup.XamlReader.Parse(vertXaml)));
-            var trigH = new Trigger { Property = System.Windows.Controls.Primitives.ScrollBar.OrientationProperty, Value = Orientation.Horizontal };
-            trigH.Setters.Add(new Setter(Control.TemplateProperty, System.Windows.Markup.XamlReader.Parse(horizXaml)));
-            sbStyle.Triggers.Add(trigH);
-            // ScrollViewer 模板：横竖滚动条交叉处默认是系统白块，染成卡片色
-
-            // 妯珫婊氬姩鏉′氦鍙夎榛樿鐢?SystemColors.ControlBrush锛堢櫧鍧楋級鈫?鎹㈡垚鍗＄墖搴曡壊
-            lv.Resources.Add(typeof(System.Windows.Controls.Primitives.ScrollBar), sbStyle);
+            var st = new Style(typeof(System.Windows.Controls.Primitives.ScrollBar));
+            st.Setters.Add(new Setter(Control.TemplateProperty, System.Windows.Markup.XamlReader.Parse(vertXaml)));
+            var tr = new Trigger { Property = System.Windows.Controls.Primitives.ScrollBar.OrientationProperty, Value = Orientation.Horizontal };
+            tr.Setters.Add(new Setter(Control.TemplateProperty, System.Windows.Markup.XamlReader.Parse(horizXaml)));
+            st.Triggers.Add(tr);
+            return st;
         }
+
         // 滑块模板：默认模板在深/浅两套底色上都看不清，改成细轨 + 圆点
         public static Style SliderStyle()
         {
@@ -1642,6 +1733,15 @@ namespace WheelLauncher
                     Connected = any;
                     if (!any) { lastDx = 0; lastDy = 0; continue; }
 
+                    // 游戏/暂停期间手柄整体放行：不复位边沿就 continue，恢复后不会补触发
+                    if (GameWatch.Paused)
+                    {
+                        comboViewArm = true; comboStartArm = true;
+                        aWas = false; bWas = false; lbWas = false; rbWas = false;
+                        lastDx = 0; lastDy = 0;
+                        continue;
+                    }
+
                     ushort b = st.Gamepad.wButtons;
                     bool l3 = (b & BTN_L3) != 0;
                     bool comboView = l3 && (b & BTN_VIEW) != 0;
@@ -1805,7 +1905,8 @@ namespace WheelLauncher
             cv = new Canvas();
             Content = cv;
 
-            tW = 74; tH = 88; gapX = 8; gapY = 10; chipW = 18;
+            double k = Math.Max(0.7, Math.Min(1.45, Settings.WheelSize / 100.0));   // 跟随「轮盘大小」
+            tW = 74 * k; tH = 88 * k; gapX = 8 * k; gapY = 10 * k; chipW = 18 * k;
             int rowsPerCol = Math.Max(1, (int)Math.Floor((maxH - 70) / (tH + gapY)));
             var cols = new List<List<KeyValuePair<char, List<AppEntry>>>>();
             var curCol = new List<KeyValuePair<char, List<AppEntry>>>();
@@ -1842,16 +1943,16 @@ namespace WheelLauncher
             var bg = new Border();
             bg.Width = contentW; bg.Height = contentH;
             bg.CornerRadius = new CornerRadius(16);
-            bg.Background = new LinearGradientBrush(Ui.BgCol, Ui.Mix(Ui.BgCol, Ui.CardCol, 0.9), 90);
-            bg.BorderBrush = new SolidColorBrush(Ui.LineCol);
+            bg.Background = new LinearGradientBrush(WheelSkin.Disc(246, 0), WheelSkin.Disc(246, 14), 90);
+            bg.BorderBrush = new SolidColorBrush(WheelSkin.A(115));
             bg.BorderThickness = new Thickness(1);
             Canvas.SetLeft(bg, 0); Canvas.SetTop(bg, 0);
             cv.Children.Add(bg);
 
             var head = new TextBlock();
             head.Text = caption + (gPages.Count > 1 ? "   " + (gPage + 1) + "/" + gPages.Count : "");
-            head.FontSize = 14.5;
-            head.Foreground = new SolidColorBrush(Ui.InkCol);
+            head.FontSize = 14.5 * k;
+            head.Foreground = new SolidColorBrush(WheelSkin.H(240));
             head.FontWeight = FontWeights.SemiBold;
             Canvas.SetLeft(head, padL); Canvas.SetTop(head, 8);
             cv.Children.Add(head);
@@ -1865,8 +1966,8 @@ namespace WheelLauncher
                     double x = baseX;
                     var lt = new TextBlock();
                     lt.Text = kv.Key == '[' ? "#" : kv.Key.ToString();
-                    lt.FontSize = 11.5;
-                    lt.Foreground = new SolidColorBrush(Ui.SubCol);
+                    lt.FontSize = 11.5 * k;
+                    lt.Foreground = new SolidColorBrush(WheelSkin.A(180));
                     Canvas.SetLeft(lt, x + 1); Canvas.SetTop(lt, y + tH / 2 - 8);
                     cv.Children.Add(lt);
                     x += chipW;
@@ -1875,9 +1976,9 @@ namespace WheelLauncher
                         var bd = new Border();
                         bd.Width = tW; bd.Height = tH;
                         bd.CornerRadius = new CornerRadius(10);
-                        bd.Background = new SolidColorBrush(Ui.Mix(Ui.CardCol, Ui.BgCol, 0.35));
+                        bd.Background = new SolidColorBrush(WheelSkin.Disc(232, 12));
                         bd.BorderThickness = new Thickness(1);
-                        bd.BorderBrush = new SolidColorBrush(Ui.LineCol);
+                        bd.BorderBrush = new SolidColorBrush(WheelSkin.A(58));
                         var sp = new StackPanel();
                         sp.VerticalAlignment = VerticalAlignment.Center;
                         var img = new Image();
@@ -1887,11 +1988,11 @@ namespace WheelLauncher
                         RenderOptions.SetBitmapScalingMode(img, BitmapScalingMode.HighQuality);
                         var nm = new TextBlock();
                         nm.Text = it.Name;
-                        nm.FontSize = 10.5;
+                        nm.FontSize = 10.5 * k;
                         nm.Margin = new Thickness(3, 3, 3, 0);
                         nm.TextAlignment = TextAlignment.Center;
                         nm.TextTrimming = TextTrimming.CharacterEllipsis;
-                        nm.Foreground = new SolidColorBrush(Ui.InkCol);
+                        nm.Foreground = new SolidColorBrush(WheelSkin.H(230));
                         sp.Children.Add(img);
                         sp.Children.Add(nm);
                         bd.Child = sp;
@@ -1909,27 +2010,27 @@ namespace WheelLauncher
 
             tipBar = new Border();
             tipBar.CornerRadius = new CornerRadius(8);
-            tipBar.Background = new SolidColorBrush(Ui.Mix(Ui.LineCol, Ui.BgCol, 0.55));
+            tipBar.Background = new SolidColorBrush(WheelSkin.Disc(240, 8));
             tipBar.Padding = new Thickness(10, 4, 10, 4);
             tipBar.Visibility = Visibility.Collapsed;
             tip = new TextBlock();
             tip.FontSize = 12.5;
-            tip.Foreground = new SolidColorBrush(Ui.InkCol);
+            tip.Foreground = new SolidColorBrush(WheelSkin.H(240));
             tipBar.Child = tip;
             cv.Children.Add(tipBar);
 
             gear = new Border();
             gear.Width = 36; gear.Height = 36;
             gear.CornerRadius = new CornerRadius(9);
-            gear.Background = new SolidColorBrush(Ui.Mix(Ui.CardCol, Ui.BgCol, 0.35));
+            gear.Background = new SolidColorBrush(WheelSkin.Disc(232, 12));
             gear.BorderThickness = new Thickness(1);
-            gear.BorderBrush = new SolidColorBrush(Ui.LineCol);
+            gear.BorderBrush = new SolidColorBrush(WheelSkin.A(70));
             var gt = new TextBlock();
             gt.Text = "\u2699";
             gt.FontSize = 18;
             gt.HorizontalAlignment = HorizontalAlignment.Center;
             gt.VerticalAlignment = VerticalAlignment.Center;
-            gt.Foreground = new SolidColorBrush(Ui.SubCol);
+            gt.Foreground = new SolidColorBrush(WheelSkin.A(225));
             gear.Child = gt;
             Canvas.SetLeft(gear, contentW - 50); Canvas.SetTop(gear, contentH - 50);
             cv.Children.Add(gear);
@@ -1961,8 +2062,8 @@ namespace WheelLauncher
         void GearHot(bool on)
         {
             if (gear == null) return;
-            gear.Background = new SolidColorBrush(on ? Ui.Mix(Ui.CardCol, Ui.AccentCol, 0.30) : Ui.Mix(Ui.CardCol, Ui.BgCol, 0.35));
-            gear.BorderBrush = new SolidColorBrush(on ? Ui.AccentCol : Ui.LineCol);
+            gear.Background = new SolidColorBrush(on ? WheelSkin.A(110) : WheelSkin.Disc(232, 12));
+            gear.BorderBrush = new SolidColorBrush(on ? WheelSkin.H(255) : WheelSkin.A(70));
         }
 
         // 键盘/手柄把「设置」齿轮当普通目标选中
@@ -2011,8 +2112,8 @@ namespace WheelLauncher
             lastIdx = idx;
             for (int i = 0; i < tiles.Count; i++)
             {
-                tiles[i].Background = new SolidColorBrush(i == idx ? Ui.Mix(Ui.CardCol, Ui.AccentCol, 0.30) : Ui.Mix(Ui.CardCol, Ui.BgCol, 0.35));
-                tiles[i].BorderBrush = new SolidColorBrush(i == idx ? Ui.AccentCol : Ui.LineCol);
+                tiles[i].Background = new SolidColorBrush(i == idx ? WheelSkin.A(85) : WheelSkin.Disc(232, 12));
+                tiles[i].BorderBrush = new SolidColorBrush(i == idx ? WheelSkin.H(255) : WheelSkin.A(58));
             }
             if (idx >= 0 && idx < tiles.Count && idx < tcx.Count && idx < tcy.Count)
             {
@@ -2885,8 +2986,19 @@ namespace WheelLauncher
             try
             {
                 Log.W("launch name=" + e.Name + " path=" + e.Path + " args=" + e.Args);
+                if (e.Path != null && e.Path.StartsWith("shell:", StringComparison.OrdinalIgnoreCase))
+                {
+                    Process.Start(new ProcessStartInfo("explorer.exe", e.Path) { UseShellExecute = true });
+                    return;
+                }
                 if (Directory.Exists(e.Path))
                 {
+                    Process.Start(new ProcessStartInfo("explorer.exe", "\"" + e.Path + "\"") { UseShellExecute = true });
+                    return;
+                }
+                if (WheelApp.IsElevated && Settings.LaunchAsUser && string.IsNullOrEmpty(e.Args) && File.Exists(e.Path))
+                {
+                    Log.W("launch as standard user via explorer");
                     Process.Start(new ProcessStartInfo("explorer.exe", "\"" + e.Path + "\"") { UseShellExecute = true });
                     return;
                 }
@@ -2918,6 +3030,20 @@ namespace WheelLauncher
 
         [DllImport("user32.dll")]
         public static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct COPYDATASTRUCT
+        {
+            public IntPtr dwData;
+            public int cbData;
+            public IntPtr lpData;
+        }
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, ref COPYDATASTRUCT lParam);
         [StructLayout(LayoutKind.Sequential)]
         public struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public int x; public int y; public uint lPrivate; }
 
@@ -3404,6 +3530,24 @@ namespace WheelLauncher
             set { Set("tabhotkey", value ? "1" : "0"); }
         }
 
+        /// 以标准用户权限启动程序：管理员实例直接 Start 会让子进程继承管理员令牌，
+        /// 有些程序（biubiu 等）检测到管理员令牌会立刻退出，改用 explorer 代启。
+        public static bool LaunchAsUser
+        {
+            get { return GetInt("launchstd", 1) != 0; }
+            set { Set("launchstd", value ? "1" : "0"); }
+        }
+        public static bool SystemItems
+        {
+            get { return GetInt("sysitems", 1) != 0; }
+            set { Set("sysitems", value ? "1" : "0"); }
+        }
+        /// 搜索时是否也用 Everything 查文件（关掉就只搜本机应用，不启动 es.exe、不发 IPC）
+        public static bool UseEverything
+        {
+            get { return GetInt("useeverything", 1) != 0; }
+            set { Set("useeverything", value ? "1" : "0"); }
+        }
         public static bool AutoFolders
         {
             get { return GetInt("autofolders", 1) != 0; }
@@ -3514,6 +3658,8 @@ namespace WheelLauncher
         public static Func<int, int, bool> LeftClick;
         public static Action<int> PageFlip;      // 滚轮 / 方括号 / 肩键翻页
         public static Action<int> HotkeyFire;
+        // typing on the circular wheel jumps into search
+        public static Func<string, bool> SearchOpen;
         public static System.Windows.Threading.Dispatcher UiDispatcher;
         static volatile bool wheelShown;
         static volatile bool swallowedDown;   // 已吞下左键按下 → 抬起也要吞，保证配对
@@ -3726,6 +3872,26 @@ namespace WheelLauncher
                             }
                         }
                         bool open = WheelOpen != null && WheelOpen();
+                        // typing on the circular wheel jumps into search (grid keeps its WASD nav)
+                        if (open && WheelWindow.Active != null && SearchOpen != null
+                            && (Native.GetAsyncKeyState(0x11) & 0x8000) == 0
+                            && (Native.GetAsyncKeyState(0x12) & 0x8000) == 0
+                            && (Native.GetAsyncKeyState(0x10) & 0x8000) == 0)
+                        {
+                            char ck = '\0';
+                            if (vk >= 0x41 && vk <= 0x5A) ck = (char)vk;
+                            else if (vk >= 0x30 && vk <= 0x39) ck = (char)vk;
+                            if (ck != '\0')
+                            {
+                                string seed = ck.ToString();
+                                var so = SearchOpen;
+                                System.Windows.Application.Current.Dispatcher.BeginInvoke(new Action(delegate
+                                {
+                                    try { so(seed); } catch (Exception exq) { Log.W("search from wheel failed: " + exq.Message); }
+                                }));
+                                return (IntPtr)1;
+                            }
+                        }
                         if (vk == 0x09)
                         {
                             // Alt/Ctrl/Shift/Win + Tab 一律放行，否则 Alt+Tab 切窗口会被打断
@@ -3832,7 +3998,7 @@ namespace WheelLauncher
 
     public static class WheelSkin
     {
-        public static readonly string[] Names = { "轮回眼 · 紫", "鎏金 · 琥珀", "青霜 · 冰蓝", "极简 · 雾白", "赛博 · 品红", "松影 · 青绿" };
+        public static readonly string[] Names = { "轮回眼 · 紫", "鎏金 · 琥珀", "青霜 · 冰蓝", "极简 · 雾白", "赛博 · 品红", "松影 · 青绿", "素白 · 极简", "曜黑 · 极简" };
         public static int Index
         {
             get
@@ -3854,6 +4020,8 @@ namespace WheelLauncher
                     case 3: return new byte[] { 214, 214, 222 };
                     case 4: return new byte[] { 236, 96, 180 };
                     case 5: return new byte[] { 104, 198, 150 };
+                    case 6: return new byte[] { 54, 52, 66 };      // 素白：深灰当强调色
+                    case 7: return new byte[] { 188, 188, 200 };   // 曜黑：浅灰当强调色
                     default: return new byte[] { 132, 112, 236 };
                 }
             }
@@ -3870,6 +4038,8 @@ namespace WheelLauncher
                     case 3: return new byte[] { 255, 255, 255 };
                     case 4: return new byte[] { 255, 158, 216 };
                     case 5: return new byte[] { 158, 232, 196 };
+                    case 6: return new byte[] { 22, 20, 28 };      // 素白：文字近黑
+                    case 7: return new byte[] { 238, 238, 244 };   // 曜黑：文字近白
                     default: return new byte[] { 186, 170, 255 };
                 }
             }
@@ -3886,6 +4056,8 @@ namespace WheelLauncher
                     case 3: return new byte[] { 30, 30, 36 };
                     case 4: return new byte[] { 42, 16, 34 };
                     case 5: return new byte[] { 14, 36, 28 };
+                    case 6: return new byte[] { 244, 244, 247 };   // 素白：浅灰底
+                    case 7: return new byte[] { 8, 8, 10 };        // 曜黑：近黑底
                     default: return new byte[] { 28, 22, 46 };
                 }
             }
@@ -3896,7 +4068,9 @@ namespace WheelLauncher
         public static Color Disc(int a, int lift)
         {
             var c = HubBg;
-            int r = c[0] + lift, g = c[1] + lift, b = c[2] + lift;
+            int step = lift;
+            if (Index == 6) step = -lift;   // 素白：越"lift"越暗，卡片才看得清
+            int r = c[0] + step, g = c[1] + step, b = c[2] + step;
             if (r > 255) r = 255; if (g > 255) g = 255; if (b > 255) b = 255;
             return Color.FromArgb((byte)a, (byte)r, (byte)g, (byte)b);
         }
@@ -4234,7 +4408,7 @@ namespace WheelLauncher
                 };
                 var tipBg = new Border
                 {
-                    Background = new SolidColorBrush(Color.FromArgb(160, 10, 8, 18)),
+                    Background = new SolidColorBrush(WheelSkin.Disc(190, 6)),
                     CornerRadius = new CornerRadius(10),
                     Padding = new Thickness(12, 4, 12, 4),
                     Child = tip
@@ -4727,7 +4901,7 @@ Dispatcher.BeginInvoke(new Action(delegate
             rbRelease.Margin = new Thickness(0, 0, 0, 10);
             rbRelease.Checked += delegate { if (rbRelease.IsChecked == true) { Settings.ReleaseMode = 0; Changed = true; } };
 
-            var rbClick = Ui.MkRadio("只呼出圆盘（松开侧键不启动，左键点图标才打开；Esc / 点空白关闭）", "releasemode", Settings.ReleaseMode == 1);
+            var rbClick = Ui.MkRadio("只呼出轮盘（松开侧键不启动，左键点图标才打开；Esc / 点空白关闭）", "releasemode", Settings.ReleaseMode == 1);
             rbClick.Checked += delegate { if (rbClick.IsChecked == true) { Settings.ReleaseMode = 1; Changed = true; } };
 
             panel.Children.Add(rbRelease);
@@ -4765,13 +4939,83 @@ Dispatcher.BeginInvoke(new Action(delegate
             bMore.HorizontalAlignment = HorizontalAlignment.Left;
             bMore.Click += delegate { var wa = Application.Current as WheelApp; if (wa != null) wa.OpenSettings(); };
             panel.Children.Add(bMore);
+            var cbStd = new CheckBox
+            {
+                Content = "以标准用户权限启动程序（推荐：部分程序拿到管理员权限会直接退出）",
+                IsChecked = Settings.LaunchAsUser,
+                Foreground = new SolidColorBrush(Ui.InkCol),
+                Margin = new Thickness(0, 14, 0, 0),
+                FontSize = 12.5
+            };
+            Ui.StyleCheck(cbStd);
+            cbStd.Checked += delegate { Settings.LaunchAsUser = true; Changed = true; };
+            cbStd.Unchecked += delegate { Settings.LaunchAsUser = false; Changed = true; };
+            panel.Children.Add(cbStd);
+            panel.Children.Add(new Border { Height = 1, Background = new SolidColorBrush(Ui.LineCol), Margin = new Thickness(0, 20, 0, 16) });
+            var hSearch = new TextBlock
+            {
+                Text = "搜索",
+                FontSize = 13.5,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = new SolidColorBrush(Ui.InkCol),
+                Margin = new Thickness(0, 0, 0, 6)
+            };
+            panel.Children.Add(hSearch);
+            Action refreshEvery = null;
+            var cbEvery = new CheckBox
+            {
+                Content = "搜索时也查找文件（Everything）",
+                IsChecked = Settings.UseEverything,
+                Foreground = new SolidColorBrush(Ui.InkCol),
+                FontSize = 12.5
+            };
+            Ui.StyleCheck(cbEvery);
+            cbEvery.Checked += delegate { Settings.UseEverything = true; Changed = true; if (refreshEvery != null) refreshEvery(); };
+            cbEvery.Unchecked += delegate { Settings.UseEverything = false; Changed = true; if (refreshEvery != null) refreshEvery(); };
+            panel.Children.Add(cbEvery);
+            var stEvery = new TextBlock
+            {
+                FontSize = 11.5,
+                Foreground = new SolidColorBrush(Ui.MutedCol),
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 6, 0, 0)
+            };
+            panel.Children.Add(stEvery);
+            refreshEvery = delegate
+            {
+                if (!Settings.UseEverything)
+                {
+                    stEvery.Text = "已关闭：F9 只搜索本机应用，不会启动 es.exe、也不会读取 Everything 索引。";
+                    stEvery.Foreground = new SolidColorBrush(Ui.MutedCol);
+                    return;
+                }
+                string esPath = EsCli.Find();
+                if (esPath != null)
+                {
+                    stEvery.Text = "已就绪：es.exe 已找到（" + esPath + "），输入时会同时列出应用与全盘文件。";
+                    stEvery.Foreground = new SolidColorBrush(Ui.MutedCol);
+                }
+                else if (EverythingIpc.Available)
+                {
+                    stEvery.Text = "已检测到 Everything，但缺 es.exe：打开搜索框时会提示一键下载。";
+                    stEvery.Foreground = new SolidColorBrush(Ui.WarnFgCol);
+                }
+                else
+                {
+                    stEvery.Text = "未检测到 Everything：目前只能搜本机应用；打开搜索框可点提示安装 Everything。";
+                    stEvery.Foreground = new SolidColorBrush(Ui.WarnFgCol);
+                }
+            };
+            refreshEvery();
             var sc0 = new ScrollViewer
             {
                 Content = panel,
                 VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
                 HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
-                Padding = new Thickness(0, 0, 6, 0)
+                Padding = new Thickness(0, 0, 12, 0)
             };
+            // 宽一点的滚动条：外观页内容长，12px 的细条太难拖也难看清
+            sc0.Resources.Add(typeof(System.Windows.Controls.Primitives.ScrollBar), Ui.ScrollBarStyle(16));
             return sc0;
             return panel;
         }
@@ -5171,6 +5415,29 @@ var cornerPatch = new System.Windows.Shapes.Rectangle
                 w.ShowDialog();
                 if (w.Added > 0) { Changed = true; ReloadWheel(); Notify(); }
             };
+            var cbSys = new CheckBox {
+                Content = "显示系统入口（回收站 / 控制面板 / 设备管理器…）",
+                IsChecked = Settings.SystemItems,
+                Margin = new Thickness(2, 10, 0, 2),
+                FontSize = 12.5
+            };
+            Ui.StyleCheck(cbSys);
+            cbSys.Checked += delegate
+            {
+                Settings.SystemItems = true; Changed = true;
+                if (Reloaded != null) Reloaded();
+                ReloadWheel(); Notify();
+            };
+            cbSys.Unchecked += delegate
+            {
+                Settings.SystemItems = false; Changed = true;
+                if (Reloaded != null) Reloaded();
+                ReloadWheel(); Notify();
+            };
+            DockPanel.SetDock(cbSys, Dock.Right);
+            cbSys.Margin = new Thickness(0, 0, 16, 0);
+            cbSys.FontSize = 11.5;
+            footRow.Children.Insert(0, cbSys);
             return panel;
         }
 
@@ -5216,14 +5483,15 @@ var cornerPatch = new System.Windows.Shapes.Rectangle
                 foreach (var a in Scanner.FromDesktop())
                 {
                     var me = Meta.Get(a.Path);
+                    bool isSys = ShellItems.IsShellItem(a.Path);
                     bool isDir = Directory.Exists(a.Path);
                     bool isCustom = custom.Exists(delegate (AppEntry c) { return string.Equals(c.Path, a.Path, StringComparison.OrdinalIgnoreCase); });
                     wheelRows.Add(new WheelRow
                     {
                         Name = (me.Pin ? "★ " : "") + (me.Hidden ? "[已隐藏] " : "") + a.Name,
                         Path = a.Path,
-                        Kind = isDir ? "文件夹" : (a.Path.ToLowerInvariant().EndsWith(".exe") ? "应用" : "文件"),
-                        Source = isCustom ? "手动添加" : "桌面快捷方式"
+                        Kind = isSys ? "系统" : (isDir ? "文件夹" : (a.Path.ToLowerInvariant().EndsWith(".exe") ? "应用" : "文件")),
+                        Source = isSys ? "系统入口" : (isCustom ? "手动添加" : "桌面快捷方式")
                     });
                 }
                 ApplyFilter();
@@ -5549,7 +5817,631 @@ var cornerPatch = new System.Windows.Shapes.Rectangle
         }
     }
 
-class WheelApp : Application
+    // ===================== 搜索（Everything 可选） =====================
+    /// <summary>Everything 的 IPC：只发公开文档里的 WM_COPYDATA，不引用它的任何二进制或源码。</summary>
+    public static class EverythingIpc
+    {
+        const string WndClass = "EVERYTHING_TASKBAR_NOTIFICATION";
+        const uint WM_COPYDATA = 0x004A;
+        const uint CopyDataQueryW = 2;
+        public const uint ReplyMsg = 0x5151;
+
+        static readonly object Gate = new object();
+        static List<Hit> last = new List<Hit>();
+        static int seq, done;
+
+        public class Hit
+        {
+            public string Name = "";
+            public string Path = "";
+            public bool Folder;
+            public string Full = "";
+            public Hit() { }
+            public Hit(string name, string path, bool folder, string full) { Name = name; Path = path; Folder = folder; Full = full; }
+        }
+
+        public static bool Available
+        {
+            get
+            {
+                try { return Native.FindWindow(WndClass, null) != IntPtr.Zero; }
+                catch { return false; }
+            }
+        }
+
+        /// <summary>同步查询（带超时）。replyHwnd 必须是我们的隐藏窗口，结果通过 WM_COPYDATA 回来。</summary>
+        public static List<Hit> Query(IntPtr replyHwnd, string text, int max, int timeoutMs)
+        {
+            var none = new List<Hit>();
+            if (replyHwnd == IntPtr.Zero) return none;
+            text = (text == null ? "" : text.Trim());
+            if (text.Length == 0 || text.Length > 240) return none;
+            IntPtr ev;
+            try { ev = Native.FindWindow(WndClass, null); }
+            catch { return none; }
+            if (ev == IntPtr.Zero) return none;
+
+            int mySeq;
+            lock (Gate) { last = new List<Hit>(); mySeq = ++seq; }
+
+            byte[] str = System.Text.Encoding.Unicode.GetBytes(text);
+            int size = 20 + str.Length + 2;              // 5*DWORD + UTF16 + 结尾 0
+            byte[] buf = new byte[size];
+            BitConverter.GetBytes((int)replyHwnd.ToInt64()).CopyTo(buf, 0);
+            BitConverter.GetBytes((int)ReplyMsg).CopyTo(buf, 4);
+            BitConverter.GetBytes(0).CopyTo(buf, 8);     // search_flags
+            BitConverter.GetBytes(0).CopyTo(buf, 12);    // offset
+            BitConverter.GetBytes(max).CopyTo(buf, 16);  // max_results
+            str.CopyTo(buf, 20);
+
+            IntPtr mem = Marshal.AllocHGlobal(size);
+            try
+            {
+                Marshal.Copy(buf, 0, mem, size);
+                var cds = new Native.COPYDATASTRUCT();
+                cds.dwData = (IntPtr)CopyDataQueryW;
+                cds.cbData = size;
+                cds.lpData = mem;
+                Native.SendMessage(ev, WM_COPYDATA, replyHwnd, ref cds);
+            }
+            catch (Exception ex) { Log.W("everything query failed: " + ex.Message); }
+            finally { Marshal.FreeHGlobal(mem); }
+
+            for (int i = 0; i < Math.Max(1, timeoutMs / 10); i++)
+            {
+                lock (Gate) { if (done == mySeq) return last; }
+                System.Threading.Thread.Sleep(10);
+            }
+            lock (Gate) { return new List<Hit>(last); }
+        }
+
+        public static void OnCopyData(IntPtr wParam, IntPtr lParam)
+        {
+            try
+            {
+                var cds = (Native.COPYDATASTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.COPYDATASTRUCT));
+                if ((uint)cds.dwData.ToInt64() != ReplyMsg) return;
+                if (cds.lpData == IntPtr.Zero || cds.cbData < 28) return;
+                IntPtr p = cds.lpData;
+                int numItems = Marshal.ReadInt32(p, 20);
+                if (numItems <= 0) { lock (Gate) { last = new List<Hit>(); done = seq; } return; }
+                int maxItems = Math.Min(numItems, (cds.cbData - 28) / 12);
+                var list = new List<Hit>(maxItems);
+                for (int i = 0; i < maxItems; i++)
+                {
+                    int b = 28 + i * 12;
+                    if (b + 12 > cds.cbData) break;
+                    int flags = Marshal.ReadInt32(p, b);
+                    int nameOff = Marshal.ReadInt32(p, b + 4);
+                    int pathOff = Marshal.ReadInt32(p, b + 8);
+                    if (nameOff <= 0 || nameOff >= cds.cbData || pathOff < 0 || pathOff >= cds.cbData) continue;
+                    var hit = new Hit();
+                    hit.Name = Marshal.PtrToStringUni(new IntPtr(p.ToInt64() + nameOff)) ?? "";
+                    hit.Path = Marshal.PtrToStringUni(new IntPtr(p.ToInt64() + pathOff)) ?? "";
+                    hit.Folder = (flags & 0x00000001) != 0;
+                    hit.Full = hit.Path.EndsWith("\\") ? hit.Path + hit.Name : hit.Path + "\\" + hit.Name;
+                    if (hit.Name.Length > 0) list.Add(hit);
+                }
+                lock (Gate) { last = list; done = seq; }
+            }
+            catch (Exception ex) { Log.W("everything reply failed: " + ex.Message); }
+        }
+    }
+
+    /// <summary>呼出式搜索框：支持应用（本地）+ 文件（Everything，可选）。</summary>
+    // es.exe backend (official Everything CLI). The raw WM_COPYDATA IPC path does not
+    // get a reply on some Everything versions, while the CLI works reliably.
+    // We do not bundle it: it is auto-downloaded into the data folder on demand.
+    public static class EsCli
+    {
+        static string cachedExe;
+        static DateTime cachedAt = DateTime.MinValue;
+
+        public static string DataExe { get { return System.IO.Path.Combine(Paths.Root, "es.exe"); } }
+
+        public static string Find()
+        {
+            if (cachedAt > DateTime.MinValue && (DateTime.Now - cachedAt).TotalSeconds < 15) return cachedExe;
+            var cands = new List<string>();
+            try { cands.Add(DataExe); } catch { }
+            try
+            {
+                string self = System.Diagnostics.Process.GetCurrentProcess().MainModule.FileName;
+                cands.Add(System.IO.Path.Combine(System.IO.Path.GetDirectoryName(self), "es.exe"));
+            }
+            catch { }
+            cands.Add(@"C:\Program Files\Everything\es.exe");
+            cands.Add(@"C:\Program Files (x86)\Everything\es.exe");
+            try
+            {
+                string env = Environment.GetEnvironmentVariable("PATH") ?? "";
+                foreach (string p in env.Split(';')) if (p.Trim().Length > 0) cands.Add(System.IO.Path.Combine(p.Trim(), "es.exe"));
+            }
+            catch { }
+            cachedExe = null;
+            foreach (string c in cands)
+            {
+                try { if (File.Exists(c)) { cachedExe = c; break; } } catch { }
+            }
+            cachedAt = DateTime.Now;
+            return cachedExe;
+        }
+
+        public static void ResetCache() { cachedAt = DateTime.MinValue; cachedExe = null; }
+
+        public static List<EverythingIpc.Hit> Search(string text, int max, int timeoutMs)
+        {
+            var list = new List<EverythingIpc.Hit>();
+            string exe = Find();
+            if (exe == null || text == null || text.Trim().Length == 0) return list;
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo();
+                psi.FileName = exe;
+                psi.Arguments = "-n " + max + " \"" + text.Replace("\"", "") + "\"";
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                try { psi.StandardOutputEncoding = Encoding.GetEncoding(936); } catch { }
+                using (var p = System.Diagnostics.Process.Start(psi))
+                {
+                    string outp = "";
+                    var rd = new System.Threading.Thread(new System.Threading.ThreadStart(delegate { try { outp = p.StandardOutput.ReadToEnd(); } catch { } }));
+                    rd.IsBackground = true;
+                    rd.Start();
+                    if (!p.WaitForExit(timeoutMs)) { try { p.Kill(); } catch { } }
+                    try { rd.Join(300); } catch { }
+                    foreach (string raw in outp.Split('\n'))
+                    {
+                        string line = raw.TrimEnd('\r').Trim();
+                        if (line.Length < 3) continue;
+                        var h = new EverythingIpc.Hit();
+                        h.Full = line;
+                        bool isDir = false;
+                        try { isDir = Directory.Exists(line); } catch { }
+                        h.Folder = isDir;
+                        h.Name = System.IO.Path.GetFileName(line);
+                        string par = System.IO.Path.GetDirectoryName(line);
+                        h.Path = par == null ? "" : par;
+                        list.Add(h);
+                        if (list.Count >= max) break;
+                    }
+                }
+            }
+            catch (Exception ex) { Log.W("escli search failed: " + ex.Message); }
+            return list;
+        }
+
+        public static bool Download(out string msg)
+        {
+            msg = "";
+            try
+            {
+                string url = "https://www.voidtools.com/ES-1.1.0.27.zip";
+                string tmp = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "wl_es_" + Guid.NewGuid().ToString("N") + ".zip");
+                using (var wc = new System.Net.WebClient())
+                {
+                    wc.Headers.Add("User-Agent", "WheelLauncher");
+                    wc.DownloadFile(url, tmp);
+                }
+                using (var zip = System.IO.Compression.ZipFile.OpenRead(tmp))
+                {
+                    System.IO.Compression.ZipArchiveEntry ent = null;
+                    foreach (var en in zip.Entries)
+                    {
+                        if (en.Name.Equals("es.exe", StringComparison.OrdinalIgnoreCase)) { ent = en; break; }
+                    }
+                    if (ent == null) { msg = "zip has no es.exe"; return false; }
+                    string dst = DataExe;
+                    try { if (File.Exists(dst)) File.Delete(dst); } catch { }
+                    using (var s = ent.Open())
+                    using (var fs = File.Create(dst)) { s.CopyTo(fs); }
+                }
+                try { File.Delete(tmp); } catch { }
+                ResetCache();
+                msg = "ok";
+                Log.W("escli downloaded " + DataExe);
+                return File.Exists(DataExe);
+            }
+            catch (Exception ex) { msg = ex.Message; Log.W("escli download failed: " + ex.Message); return false; }
+        }
+    }
+
+    public class QuickSearchWindow : Window
+    {
+        public static IntPtr ReplyHwnd;
+
+        class Row
+        {
+            public string Title = "";
+            public string Sub = "";
+            public string Path = "";
+            public bool IsFile;
+            public ImageSource Icon;
+        }
+
+        TextBox tb;
+        StackPanel spRows;
+        TextBlock tbHint;
+        ScrollViewer scroller;
+        List<Row> rows = new List<Row>();
+        Border[] rowBoxes;
+        int sel;
+        int gen;
+        DispatcherTimer debounce;
+        AppEntry[] allApps;
+
+        public QuickSearchWindow()
+        {
+            WindowStyle = WindowStyle.None;
+            AllowsTransparency = true;
+            Background = Brushes.Transparent;
+            Topmost = true;
+            ShowInTaskbar = false;
+            ResizeMode = ResizeMode.NoResize;
+            WindowStartupLocation = WindowStartupLocation.Manual;
+            Width = 720; Height = 452;
+            Ui.Crisp(this);
+
+            var root = new Border();
+            root.CornerRadius = new CornerRadius(14);
+            root.Background = new SolidColorBrush(Ui.CardCol);
+            root.BorderBrush = new SolidColorBrush(WheelSkin.A(150));
+            root.BorderThickness = new Thickness(1);
+            root.Effect = new System.Windows.Media.Effects.DropShadowEffect { BlurRadius = 28, ShadowDepth = 6, Opacity = 0.45, Color = Colors.Black };
+
+            var g = new Grid();
+            g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            tb = new TextBox();
+            tb.FontSize = 19;
+            tb.BorderThickness = new Thickness(0);
+            tb.Background = Brushes.Transparent;
+            tb.Foreground = new SolidColorBrush(Ui.InkCol);
+            tb.CaretBrush = new SolidColorBrush(Ui.InkCol);
+            tb.Padding = new Thickness(20, 16, 20, 14);
+            tb.FontFamily = new FontFamily("Microsoft YaHei UI, Segoe UI");
+            tb.TextChanged += delegate { Restart(); };
+            tb.PreviewKeyDown += OnKey;
+            Grid.SetRow(tb, 0);
+            g.Children.Add(tb);
+
+            var line = new Border();
+            line.Height = 1;
+            line.Background = new SolidColorBrush(Ui.LineCol);
+            Grid.SetRow(line, 1);
+            g.Children.Add(line);
+
+            scroller = new ScrollViewer();
+            scroller.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+            scroller.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
+            scroller.Padding = new Thickness(8, 6, 8, 6);
+            scroller.Focusable = false;
+            spRows = new StackPanel();
+            scroller.Content = spRows;
+            Grid.SetRow(scroller, 2);
+            g.Children.Add(scroller);
+
+            var foot = new Border();
+            foot.Background = new SolidColorBrush(WheelSkin.Disc(238, 6));
+            foot.CornerRadius = new CornerRadius(0, 0, 14, 14);
+            foot.Padding = new Thickness(18, 8, 18, 9);
+            var fd = new DockPanel();
+            tbHint = new TextBlock();
+            tbHint.FontSize = 11.5;
+            tbHint.Foreground = new SolidColorBrush(Ui.MutedCol);
+            tbHint.VerticalAlignment = VerticalAlignment.Center;
+            tbHint.Cursor = Cursors.Hand;
+            tbHint.MouseLeftButtonUp += delegate
+            {
+                if (EsCli.Find() != null) return;
+                if (EverythingIpc.Available)
+                {
+                    string dm;
+                    bool ok = EsCli.Download(out dm);
+                    tbHint.Text = ok ? "es.exe 已就绪，正在搜索…" : ("下载失败：" + dm);
+                    if (ok) Restart();
+                    else tbHint.Foreground = new SolidColorBrush(Ui.WarnFgCol);
+                    return;
+                }
+                try { Process.Start(new ProcessStartInfo("https://www.voidtools.com/downloads/") { UseShellExecute = true }); }
+                catch { }
+            };
+            var keys = new TextBlock();
+            keys.Text = "↑↓ 选择   Enter 打开   Esc 关闭";
+            keys.FontSize = 11.5;
+            keys.Foreground = new SolidColorBrush(Ui.MutedCol);
+            keys.VerticalAlignment = VerticalAlignment.Center;
+            DockPanel.SetDock(keys, Dock.Right);
+            fd.Children.Add(keys);
+            fd.Children.Add(tbHint);
+            foot.Child = fd;
+            Grid.SetRow(foot, 3);
+            g.Children.Add(foot);
+
+            root.Child = g;
+            Content = root;
+
+            debounce = new DispatcherTimer();
+            debounce.Interval = TimeSpan.FromMilliseconds(140);
+            debounce.Tick += delegate { debounce.Stop(); RunSearch(); };
+
+            Loaded += delegate { tb.Focus(); };
+            PreviewKeyDown += OnKey;
+        }
+
+        public void SetApps(AppEntry[] apps) { allApps = apps; }
+
+        public void Seed(string text)
+        {
+            tb.Text = text == null ? "" : text;
+            tb.CaretIndex = tb.Text.Length;
+        }
+
+        public void PlaceNear(int sx, int sy, double scale)
+        {
+            try
+            {
+                double w = Width, h = Height;
+                double left = sx / scale - w / 2.0;
+                double top = sy / scale - h * 0.32;
+                var scr = WF.Screen.FromPoint(new System.Drawing.Point(sx, sy)).WorkingArea;
+                double minL = scr.Left / scale, maxL = (scr.Right / scale) - w - 8;
+                double minT = scr.Top / scale, maxT = (scr.Bottom / scale) - h - 8;
+                if (left < minL) left = minL;
+                if (left > maxL) left = maxL;
+                if (top < minT) top = minT;
+                if (top > maxT) top = maxT;
+                Left = left; Top = top;
+            }
+            catch { }
+        }
+
+        void OnKey(object sender, KeyEventArgs e)
+        {
+            if (e.Key == Key.Escape) { e.Handled = true; Close(); return; }
+            if (e.Key == Key.Enter) { e.Handled = true; Launch(sel); return; }
+            if (e.Key == Key.Down) { e.Handled = true; MoveSel(1); return; }
+            if (e.Key == Key.Up) { e.Handled = true; MoveSel(-1); return; }
+            if (e.Key == Key.Tab) { e.Handled = true; MoveSel(1); return; }
+        }
+
+        void MoveSel(int d)
+        {
+            if (rows.Count == 0) return;
+            sel = (sel + d + rows.Count) % rows.Count;
+            ApplySel();
+        }
+
+        void ApplySel()
+        {
+            if (rowBoxes == null) return;
+            for (int i = 0; i < rowBoxes.Length; i++)
+            {
+                var b = rowBoxes[i];
+                if (b == null) continue;
+                b.Background = new SolidColorBrush(i == sel ? Ui.SelBgCol : Colors.Transparent);
+                b.BorderBrush = new SolidColorBrush(i == sel ? WheelSkin.A(180) : Colors.Transparent);
+            }
+            try
+            {
+                if (sel >= 0 && sel < rowBoxes.Length && rowBoxes[sel] != null)
+                    rowBoxes[sel].BringIntoView();
+            }
+            catch { }
+        }
+
+        void Restart()
+        {
+            debounce.Stop();
+            debounce.Start();
+            UpdateHint();
+        }
+
+        void UpdateHint()
+        {
+            if (!Settings.UseEverything)
+            {
+                tbHint.Text = "仅搜索本机应用 · 文件搜索已在设置里关闭（外观与行为 → 搜索）";
+                tbHint.Foreground = new SolidColorBrush(Ui.MutedCol);
+            }
+            else if (EsCli.Find() != null)
+            {
+                tbHint.Text = "应用 + 文件（Everything）· 共 " + rows.Count + " 项";
+                tbHint.Foreground = new SolidColorBrush(Ui.MutedCol);
+            }
+            else if (EverythingIpc.Available)
+            {
+                tbHint.Text = "已检测到 Everything，但缺少命令行 es.exe（点此自动下载，可搜全盘文件）";
+                tbHint.Foreground = new SolidColorBrush(Ui.WarnFgCol);
+            }
+            else
+            {
+                tbHint.Text = "未检测到 Everything · 只能搜索本机应用（点此安装 Everything 后可搜全盘文件）";
+                tbHint.Foreground = new SolidColorBrush(Ui.WarnFgCol);
+            }
+        }
+
+        void RunSearch()
+        {
+            string q = (tb.Text ?? "").Trim();
+            int myGen = ++gen;
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                List<Row> res;
+                try { res = Build(q); }
+                catch (Exception ex) { Log.W("search failed: " + ex.Message); res = new List<Row>(); }
+                Dispatcher.BeginInvoke(new Action(delegate
+                {
+                    if (myGen != gen) return;
+                    Fill(res);
+                }));
+            });
+        }
+
+        List<Row> Build(string q)
+        {
+            var res = new List<Row>();
+            var apps = allApps ?? new AppEntry[0];
+            if (q.Length == 0)
+            {
+                for (int i = 0; i < apps.Length && i < 9; i++) res.Add(AppRow(apps[i]));
+                return res;
+            }
+            string qu = q.ToUpperInvariant();
+            for (int i = 0; i < apps.Length && res.Count < 8; i++)
+            {
+                var a = apps[i];
+                if (a == null || a.Name == null) continue;
+                string nm = a.Name.ToUpperInvariant();
+                bool hit = nm.IndexOf(qu, StringComparison.Ordinal) >= 0;
+                if (!hit)
+                {
+                    string py = "" + Pinyin.Get(a.Name);
+                    if (py != null && py.ToUpperInvariant().StartsWith(qu, StringComparison.Ordinal)) hit = true;
+                }
+                if (hit) res.Add(AppRow(a));
+            }
+            {
+                var files = !Settings.UseEverything
+                    ? new List<EverythingIpc.Hit>()
+                    : (EsCli.Find() != null ? EsCli.Search(q, 14, 1200) : (EverythingIpc.Available ? EverythingIpc.Query(ReplyHwnd, q, 14, 700) : new List<EverythingIpc.Hit>()));
+                Log.W("search q=" + q + " es=" + (EsCli.Find() != null) + " use=" + Settings.UseEverything + " files=" + files.Count);
+                foreach (var f in files)
+                {
+                    if (res.Count >= 14) break;
+                    bool dup = false;
+                    for (int i = 0; i < res.Count; i++) if (string.Equals(res[i].Path, f.Full, StringComparison.OrdinalIgnoreCase)) { dup = true; break; }
+                    if (dup) continue;
+                    var r = new Row();
+                    r.Title = f.Name;
+                    r.Sub = f.Path;
+                    r.Path = f.Full;
+                    r.IsFile = f.Folder;
+                    try { r.Icon = Icons.Get(f.Full); } catch { }
+                    res.Add(r);
+                }
+            }
+            return res;
+        }
+
+        Row AppRow(AppEntry a)
+        {
+            var r = new Row();
+            r.Title = a.Name;
+            r.Sub = a.Path;
+            r.Path = a.Path;
+            r.IsFile = false;
+            r.Icon = a.Icon;
+            return r;
+        }
+
+        void Fill(List<Row> res)
+        {
+            rows = res;
+            sel = 0;
+            spRows.Children.Clear();
+            rowBoxes = new Border[rows.Count];
+            for (int i = 0; i < rows.Count; i++)
+            {
+                var r = rows[i];
+                int idx = i;
+                var b = new Border();
+                b.CornerRadius = new CornerRadius(8);
+                b.Margin = new Thickness(4, 1, 4, 1);
+                b.Padding = new Thickness(10, 7, 10, 7);
+                b.BorderThickness = new Thickness(1);
+                b.Cursor = Cursors.Hand;
+                b.Background = new SolidColorBrush(Colors.Transparent);
+                b.BorderBrush = new SolidColorBrush(Colors.Transparent);
+                b.MouseLeftButtonUp += delegate { Launch(idx); };
+                b.MouseEnter += delegate { sel = idx; ApplySel(); };
+
+                var gg = new Grid();
+                gg.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(34) });
+                gg.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                gg.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+                var img = new Image();
+                img.Width = 24; img.Height = 24;
+                img.Source = r.Icon;
+                img.VerticalAlignment = VerticalAlignment.Center;
+                Grid.SetColumn(img, 0);
+                gg.Children.Add(img);
+
+                var sp = new StackPanel();
+                var t1 = new TextBlock();
+                t1.Text = r.Title;
+                t1.FontSize = 14;
+                t1.TextTrimming = TextTrimming.CharacterEllipsis;
+                t1.Foreground = new SolidColorBrush(Ui.InkCol);
+                var t2 = new TextBlock();
+                t2.Text = r.Sub;
+                t2.FontSize = 11;
+                t2.Margin = new Thickness(0, 1, 0, 0);
+                t2.TextTrimming = TextTrimming.CharacterEllipsis;
+                t2.Foreground = new SolidColorBrush(Ui.MutedCol);
+                sp.Children.Add(t1);
+                sp.Children.Add(t2);
+                Grid.SetColumn(sp, 1);
+                gg.Children.Add(sp);
+
+                var tag = new TextBlock();
+                tag.Text = r.IsFile ? "文件夹" : "应用";
+                tag.FontSize = 10.5;
+                tag.Margin = new Thickness(10, 0, 2, 0);
+                tag.VerticalAlignment = VerticalAlignment.Center;
+                tag.Foreground = new SolidColorBrush(Ui.MutedCol);
+                Grid.SetColumn(tag, 2);
+                gg.Children.Add(tag);
+
+                b.Child = gg;
+                rowBoxes[i] = b;
+                spRows.Children.Add(b);
+            }
+            if (rows.Count == 0)
+            {
+                var empty = new TextBlock();
+                empty.Text = "没有匹配项";
+                empty.FontSize = 13;
+                empty.Margin = new Thickness(16, 18, 16, 18);
+                empty.Foreground = new SolidColorBrush(Ui.MutedCol);
+                spRows.Children.Add(empty);
+            }
+            ApplySel();
+            UpdateHint();
+        }
+
+        void Launch(int i)
+        {
+            if (rows == null || i < 0 || i >= rows.Count) { Close(); return; }
+            var r = rows[i];
+            try
+            {
+                if (r.IsFile && Directory.Exists(r.Path))
+                {
+                    Process.Start(new ProcessStartInfo("explorer.exe", "\"" + r.Path + "\"") { UseShellExecute = true });
+                }
+                else
+                {
+                    var a = new AppEntry();
+                    a.Name = r.Title;
+                    a.Path = r.Path;
+                    a.Args = "";
+                    Launcher.Run(a);
+                }
+                Log.W("search launch " + r.Title + " path=" + r.Path);
+            }
+            catch (Exception ex) { Log.W("search launch failed: " + ex.Message); }
+            Close();
+        }
+    }
+
+    class WheelApp : Application
     {
         public static bool IsElevated
         {
@@ -5600,7 +6492,10 @@ class WheelApp : Application
         static System.Threading.EventWaitHandle showEvent;
         static System.Threading.EventWaitHandle quitEvent;
         System.Windows.Interop.HwndSource hkSrc;
-        const int HK_QUICK_A = 0xB10, HK_QUICK_B = 0xB11, HK_ESC = 0xB12, HK_PANIC = 0xB15;
+        const int HK_QUICK_A = 0xB10, HK_QUICK_B = 0xB11, HK_ESC = 0xB12, HK_PANIC = 0xB15, HK_SEARCH = 0xB16;
+        QuickSearchWindow searchWin;
+        bool dbgEsq, dbgSearch; string dbgEsqText = "", dbgSearchText = "";
+        bool noHotkeys;
         int lastHotkeyTick;
         public static Action<int> HotkeyFire;
         public static System.Windows.Threading.Dispatcher UiDispatcher;
@@ -5622,6 +6517,10 @@ class WheelApp : Application
             foreach (var ga in e.Args)
             {
                 if (ga == null) continue;
+                if (ga.StartsWith("--esq=", StringComparison.OrdinalIgnoreCase)) { dbgEsq = true; dbgEsqText = ga.Substring(6); }
+                if (ga.StartsWith("--search=", StringComparison.OrdinalIgnoreCase)) { dbgSearch = true; dbgSearchText = ga.Substring(9); }
+                // 测试副本专用：不抢生产实例的全局热键（否则生产实例重试用尽会一直拿不到 F7/F8）
+                if (string.Equals(ga, "--nohotkeys", StringComparison.OrdinalIgnoreCase)) noHotkeys = true;
                 if (ga.StartsWith("--gametest=", StringComparison.OrdinalIgnoreCase))
                 {
                     int gp;
@@ -5962,21 +6861,42 @@ class WheelApp : Application
                 hp.WindowStyle = unchecked((int)0x80000000);
                 hp.ExtendedWindowStyle = 0x00000080 | 0x08000000;
                 MouseHook.HotkeyFire = QuickWheel;
+            MouseHook.SearchOpen = delegate(string sq) { OpenSearch(sq); return true; };
                 MouseHook.UiDispatcher = Dispatcher;
                 hkSrc = new System.Windows.Interop.HwndSource(hp);
                 hkSrc.AddHook(HotkeyHook);
-                TryRegisterHotkeys();
-                if (!hotkeysOk)
+                if (noHotkeys) { hotkeysOk = false; Log.W("hotkeys skipped (--nohotkeys)"); }
+                else TryRegisterHotkeys();
+                if (dbgEsq || dbgSearch)
                 {
-                    // 启动瞬间常与旧实例/其它程序抢注册，失败就每 3 秒重试，直到拿到为止
+                    var dt = new DispatcherTimer();
+                    dt.Interval = TimeSpan.FromSeconds(1.6);
+                    dt.Tick += delegate
+                    {
+                        dt.Stop();
+                        if (dbgEsq)
+                        {
+                            var hits = EverythingIpc.Query(hkSrc.Handle, dbgEsqText, 10, 1500);
+                            string first = hits.Count > 0 ? hits[0].Full : "";
+                            Log.W("esq '" + dbgEsqText + "' avail=" + EverythingIpc.Available + " hits=" + hits.Count + " first=" + first);
+                            for (int i = 1; i < hits.Count && i < 4; i++) Log.W("  hit " + i + " " + hits[i].Full);
+                        }
+                        if (dbgSearch) OpenSearch(dbgSearchText);
+                    };
+                    dt.Start();
+                }
+                if (!hotkeysOk && !noHotkeys)
+                {
+                    // 启动瞬间常与旧实例/其它程序抢注册，失败就每 3 秒重试；20 次后转慢速（15 秒）继续试，
+                    // 绝不放弃——否则一旦被测试副本占过，生产实例的热键就永久失效。
                     var hkRetry = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
                     int hkTry = 0;
                     hkRetry.Tick += delegate
                     {
                         hkTry++;
                         TryRegisterHotkeys();
-                        // 重试上限：一直被别的程序占着就别无限空转（每轮都会先注销再注册，反而抢别人）
-                        if (hotkeysOk || hkTry >= 20) { hkRetry.Stop(); if (!hotkeysOk) Log.W("hotkey retry gave up after " + hkTry + " tries"); }
+                        if (hotkeysOk) { hkRetry.Stop(); Log.W("hotkey retry ok after " + hkTry + " tries"); }
+                        else if (hkTry == 20) { hkRetry.Interval = TimeSpan.FromSeconds(15); Log.W("hotkey retry slow mode (15s), keep trying"); }
                     };
                     hkRetry.Start();
                 }
@@ -6203,7 +7123,14 @@ class WheelApp : Application
 
         void OnMove(int x, int y)
         {
-            if (pressed && !dragged && wheel == null && (DateTime.Now - pressAt).TotalMilliseconds >= LongPressMs)
+            // 已经有一个被"保留"的面板时，再按一次侧键＝收起它（与 Esc 同效）
+            if (pressed && !dragged && (wheel != null || grid != null) && Settings.ReleaseMode == 1 && (DateTime.Now - pressAt).TotalMilliseconds >= LongPressMs)
+            {
+                dragged = true; hadWheel = true; pressed = false;
+                Log.W("longpress close kept panel");
+                CloseWheel();
+                return;
+            }            if (pressed && !dragged && wheel == null && (DateTime.Now - pressAt).TotalMilliseconds >= LongPressMs)
             {
                 dragged = true; hadWheel = true;
                 hotkeyWheel = false;
@@ -6243,7 +7170,18 @@ class WheelApp : Application
             if (grid != null)
             {
                 pressed = false;
-                var gh = grid.CommitAt(x, y, scale);
+                var gh = grid.CommitAt(x, y, scale);   // 顺带刷新 Hovered / 齿轮选中态
+                if (Settings.ReleaseMode == 1)
+                {
+                    // 只呼出轮盘：松开侧键不启动，面板留着等左键点选。
+                    // 与圆形轮盘一致：只有"按下后原地没动就松"才算取消，移动过就保留面板
+                    // （否则压在空白处松手会被当成取消，看起来就是"面板一闪就没"）。
+                    if (grid.HubSelected) { CloseWheel(); Log.W("grid release on gear -> close"); return; }
+                    // 只呼出轮盘：松手一律保留面板（不启动、不关闭），
+                    // 取消由 Esc / 点空白 / 再按一次侧键决定。
+                    Log.W("release mode=click keep grid shown");
+                    return;
+                }
                 CloseWheel();
                 if (gh != null) { Log.W("grid release launch " + gh.Name); Launcher.Run(gh); }
                 return;
@@ -6360,12 +7298,14 @@ class WheelApp : Application
             bool a3 = Native.RegisterHotKey(hkSrc.Handle, 0xB13, Native.MOD_NOREPEAT, 0x76);
             bool a4 = Native.RegisterHotKey(hkSrc.Handle, 0xB14, Native.MOD_NOREPEAT, 0x77);
             bool a5 = Native.RegisterHotKey(hkSrc.Handle, HK_PANIC, Native.MOD_CONTROL | Native.MOD_ALT | 0x0004u | Native.MOD_NOREPEAT, 0x79);
+            bool a6 = Native.RegisterHotKey(hkSrc.Handle, HK_SEARCH, Native.MOD_NOREPEAT, 0x78);
             hotkeysOk = a1 && a2 && a3 && a4;
             Log.W("hotkeys ctrl+alt+A=" + a1 + " ctrl+alt+B=" + a2 + " F7=" + a3 + " F8=" + a4 + " panic=" + a5);
         }
 
         IntPtr HotkeyHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
         {
+            if (msg == 0x004A) { EverythingIpc.OnCopyData(wParam, lParam); return (IntPtr)1; }
             if (msg == Native.WM_HOTKEY)
             {
                 int id = (int)wParam;
@@ -6375,6 +7315,12 @@ class WheelApp : Application
                 else if (id == 0xB14) { if ((Native.GetAsyncKeyState(0x77) & 0x8000) == 0 || wheel == null) QuickWheel(2); handled = true; }
                 else if (id == HK_PANIC) { Log.W("panic: wheel=" + (wheel != null) + " grid=" + (grid != null) + " live=" + WheelWindow.Live.Count + " rect=" + MouseHook.RectShown); CloseWheel(); WheelWindow.KillAll(); MouseHook.SetWheelRect(false, 0, 0, 0, 0); handled = true; }
                 else if (id == HK_ESC) { CloseWheel(); handled = true; }
+                else if (id == HK_SEARCH)
+                {
+                    handled = true;
+                    CloseWheel();
+                    OpenSearch("");
+                }
             }
             // 显示器/电源状态变化（合盖、分辨率变化、显示器热插拔、DPI 变化）：
             // 分层窗口在这种事件后可能“内容看不见、但矩形仍在吞鼠标”，表现为左键失灵。
@@ -6387,6 +7333,34 @@ class WheelApp : Application
                 MouseHook.SetWheelRect(false, 0, 0, 0, 0);
             }
             return IntPtr.Zero;
+        }
+
+        void OpenSearch(string seed)
+        {
+            try
+            {
+                if (searchWin != null)
+                {
+                    searchWin.Seed(seed);
+                    searchWin.Activate();
+                    Log.W("search reused");
+                    return;
+                }
+                Native.POINT sp;
+                Native.GetCursorPos(out sp);
+                double sc = GetScaleAt(sp.x, sp.y);
+                QuickSearchWindow.ReplyHwnd = (hkSrc != null ? hkSrc.Handle : IntPtr.Zero);
+                var w = new QuickSearchWindow();
+                w.SetApps(apps.ToArray());
+                w.PlaceNear(sp.x, sp.y, sc);
+                searchWin = w;
+                w.Closed += delegate { if (ReferenceEquals(searchWin, w)) searchWin = null; Log.W("search closed"); };
+                w.Seed(seed);
+                w.Show();
+                w.Activate();
+                Log.W("search open seed='" + (seed ?? "") + "' apps=" + apps.Count + " everything=" + EverythingIpc.Available);
+            }
+            catch (Exception ex) { Log.W("search open failed: " + ex); searchWin = null; }
         }
 
         void QuickWheel(int which)
@@ -6688,6 +7662,7 @@ class WheelApp : Application
                 var selfG = grid;
                 grid.Closed += delegate { if (ReferenceEquals(grid, selfG)) { if (GridWindow.Active == selfG) GridWindow.Active = null; grid = null; MouseHook.SetWheelRect(false, 0, 0, 0, 0); Log.W("grid closed externally"); } };
                 var scr = WF.Screen.FromPoint(new System.Drawing.Point(sx, sy)).WorkingArea;
+                // 尺寸由 DrawGroups 里的 k 缩放瓦片实现；面板上限保持屏幕工作区，避免放大后超出屏幕
                 grid.Build(ordered, scr.Width / scale * 0.84, scr.Height / scale * 0.80);
                 grid.PlaceAt(sx, sy, scale);
                 grid.Show();
@@ -6931,3 +7906,4 @@ static int Cap(double radius, double icon)
         }
     }
 }
+
