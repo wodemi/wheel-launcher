@@ -4613,6 +4613,83 @@ namespace WheelLauncher
             if (Active != this) { try { Live.Remove(this); Close(); } catch { } }
         }
     }
+    public class SponsorWindow : Window
+    {
+        public SponsorWindow()
+        {
+            Title = "支持这个项目";
+            Width = 480;
+            SizeToContent = SizeToContent.Height;
+            WindowStartupLocation = WindowStartupLocation.CenterOwner;
+            Background = new SolidColorBrush(Ui.BgCol);
+            var root = new StackPanel { Margin = new Thickness(22, 20, 22, 18) };
+            root.Children.Add(new TextBlock
+            {
+                Text = "如果它帮你省了时间，可以扫码请我喝杯咖啡。",
+                FontSize = 13.5,
+                Foreground = new SolidColorBrush(Ui.InkCol),
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(2, 0, 2, 14)
+            });
+            var frame = new Border
+            {
+                Background = Brushes.Transparent,
+                CornerRadius = new CornerRadius(10),
+                Padding = new Thickness(0),
+                HorizontalAlignment = HorizontalAlignment.Center
+            };
+            var qr = LoadQr();
+            if (qr != null)
+            {
+                frame.Child = new Image { Source = qr, Width = 400, Height = 400, Stretch = Stretch.Uniform };
+                root.Children.Add(frame);
+            }
+            else
+            {
+                root.Children.Add(new TextBlock
+                {
+                    Text = "（赞赏码图片未内置，可在仓库 docs/sponsor.png 查看）",
+                    FontSize = 12,
+                    Foreground = new SolidColorBrush(Ui.SubCol),
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(2, 0, 2, 12)
+                });
+            }
+            root.Children.Add(new TextBlock
+            {
+                Text = "微信扫码 · 金额随意 · 你的支持会让这个项目继续更新",
+                FontSize = 12,
+                Foreground = new SolidColorBrush(Ui.SubCol),
+                TextWrapping = TextWrapping.Wrap,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Margin = new Thickness(2, 14, 2, 14)
+            });
+            var bClose = Ui.MkButton("关闭", false);
+            bClose.Height = 34; bClose.Width = 96;
+            bClose.HorizontalAlignment = HorizontalAlignment.Center;
+            bClose.Click += delegate { Close(); };
+            root.Children.Add(bClose);
+            Content = root;
+        }
+
+        static ImageSource LoadQr()
+        {
+            try
+            {
+                var s = typeof(SponsorWindow).Assembly.GetManifestResourceStream("sponsor.png");
+                if (s == null) return null;
+                var bmp = new BitmapImage();
+                bmp.BeginInit();
+                bmp.CacheOption = BitmapCacheOption.OnLoad;
+                bmp.StreamSource = s;
+                bmp.EndInit();
+                s.Dispose();
+                return bmp;
+            }
+            catch { return null; }
+        }
+    }
+
     public class WheelSettingsWindow : Window
     {
         public class WheelRow
@@ -4715,6 +4792,18 @@ namespace WheelLauncher
             bTheme.Padding = new Thickness(14, 0, 14, 0);
             bTheme.Click += delegate { Settings.DarkUI = !Settings.DarkUI; BuildUi(curIdx); };
             nav.Children.Add(bTheme);
+
+            var bSponsor = Ui.MkButton("♥ 赞助作者", false);
+            bSponsor.Height = 36;
+            bSponsor.Margin = new Thickness(0, 8, 0, 0);
+            bSponsor.HorizontalContentAlignment = HorizontalAlignment.Left;
+            bSponsor.Padding = new Thickness(14, 0, 14, 0);
+            bSponsor.Click += delegate
+            {
+                try { var sw = new SponsorWindow { Owner = this }; sw.ShowDialog(); }
+                catch (Exception exs) { Log.W("sponsor window failed: " + exs.Message); }
+            };
+            nav.Children.Add(bSponsor);
 
             var ver = new TextBlock
             {
