@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Media;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Windows;
 using System.Windows.Controls;
@@ -23,6 +24,8 @@ namespace WheelLauncher
         public string Name;
         public string Path;
         public string Args;
+        public string Shortcut;   // 来源 .lnk（用于降权启动时保留工作目录）
+        public string WorkDir;    // 快捷方式里的"起始位置"
         public char Initial;
         public ImageSource Icon;
         public override string ToString() { return Name; }
@@ -40,7 +43,17 @@ namespace WheelLauncher
             lock (Gate)
             {
                 if (writer != null) return;
-                writer = new System.Threading.Thread(WriterLoop);
+                // 旧轮转文件可能很大（历史遗留 15MB），启动时清一次，只留 5MB 以内的 log.1
+                try
+                {
+                    foreach (var nm in new[] { "log.1.txt", "log.2.txt", "log.3.txt" })
+                    {
+                        var p2 = System.IO.Path.Combine(Paths.Root, nm);
+                        var fi = new FileInfo(p2);
+                        if (fi.Exists && (nm != "log.1.txt" || fi.Length > 5242880)) fi.Delete();
+                    }
+                }
+                catch { }                writer = new System.Threading.Thread(WriterLoop);
                 writer.IsBackground = true;
                 writer.Start();
             }
@@ -567,17 +580,20 @@ namespace WheelLauncher
                     string nm = CleanName(System.IO.Path.GetFileNameWithoutExtension(f0));
                     if (LooksJunk(f0) || LooksJunk(nm)) continue;
                     string target = f0;
-        string sArg = "";
+                    string sArg = "";
+                    string sWd = "";
+                    string sLnk = "";
                     if (ext == ".lnk")
                     {
                         target = "";
                         sArg = "";
+                        sLnk = f0;
                         try
                         {
                             if (shell != null)
                             {
                                 dynamic sc = shell.GetType().InvokeMember("CreateShortcut", System.Reflection.BindingFlags.InvokeMethod, null, shell, new object[] { f0 });
-                                try { target = sc.TargetPath; sArg = sc.Arguments; }
+                                try { target = sc.TargetPath; sArg = sc.Arguments; sWd = sc.WorkingDirectory; }
                                 finally
                                 {
                                     // IShellLink 是 RCW：不释放会随扫描次数累积（每 3 分钟一次重扫）
@@ -589,7 +605,7 @@ namespace WheelLauncher
                         if (string.IsNullOrEmpty(target) || !File.Exists(target)) continue;
                     }
                     if (!seen.Add(target.ToLowerInvariant())) continue;
-                    outp.Add(new AppEntry { Name = nm, Path = target, Args = sArg, Initial = Pinyin.Get(nm) });
+                    outp.Add(new AppEntry { Name = nm, Path = target, Args = sArg, Initial = Pinyin.Get(nm), Shortcut = sLnk, WorkDir = sWd });
                 }
             }
             if (shell != null) { try { Marshal.ReleaseComObject(shell); } catch { } }
@@ -617,7 +633,7 @@ namespace WheelLauncher
                 foreach (var lnk in lnks)
                 {
                     string name = CleanName(System.IO.Path.GetFileNameWithoutExtension(lnk));
-                    string target = "", args = "";
+                    string target = "", args = "", wdir = "";
                     try
                     {
                         if (shell != null)
@@ -626,6 +642,7 @@ namespace WheelLauncher
                                 System.Reflection.BindingFlags.InvokeMethod, null, shell, new object[] { lnk });
                             target = sc.TargetPath;
                             args = sc.Arguments;
+                            wdir = sc.WorkingDirectory;
                         }
                     }
                     catch { }
@@ -642,7 +659,7 @@ namespace WheelLauncher
                         while (list.Exists(delegate (AppEntry q) { return string.Equals(q.Name, cand, StringComparison.OrdinalIgnoreCase); })) cand = name + " " + (n2++);
                         name = cand;
                     }
-                    list.Add(new AppEntry { Name = name, Path = target, Args = args, Initial = Pinyin.Get(name) });
+                    list.Add(new AppEntry { Name = name, Path = target, Args = args, Initial = Pinyin.Get(name), Shortcut = lnk, WorkDir = wdir });
                     if ((LooksJunk(name) || LooksJunk(target)) && !Meta.Has(target))
                     {
                         try { Meta.Update(target, delegate (MetaEntry eh) { eh.Hidden = true; }); } catch { }
@@ -1621,7 +1638,7 @@ namespace WheelLauncher
                 System.Windows.Media.Color mid = Ui.Mix(System.Windows.Media.Colors.Black, System.Windows.Media.Colors.White, 0.5);
                 C("mix 50%", mid.R == 127 && mid.G == 127 && mid.B == 127);
 
-                C("skin names=6", WheelSkin.Names.Length == 6);
+                C("skin names=" + WheelSkin.Names.Length, WheelSkin.Names.Length >= 8);
                 int wi = WheelSkin.Index;
                 C("skin index in range", wi >= 0 && wi < WheelSkin.Names.Length);
 
@@ -2230,6 +2247,7 @@ namespace WheelLauncher
         public bool Hidden;
         public string Set = "auto";
         public string Cat = "";
+        public string Launch = "";   // "" 跟随全局 / user 标准用户 / admin 管理员
     }
 
     public static class Meta
@@ -2241,6 +2259,8 @@ namespace WheelLauncher
         static string K(string p) { return (p ?? "").Trim().ToLowerInvariant(); }
 
         public static void Reload() { cache = null; stamp = DateTime.MinValue; }
+
+        public static void Invalidate() { lock (Gate) { cache = null; stamp = DateTime.MinValue; } }
 
         static readonly object Gate = new object();
 
@@ -2272,6 +2292,7 @@ namespace WheelLauncher
                 e.Hidden = p.Length > 3 && p[3] == "1";
                 e.Set = p.Length > 4 && p[4].Length > 0 ? p[4] : "auto";
                 e.Cat = p.Length > 5 ? p[5] : "";
+                e.Launch = p.Length > 6 ? p[6] : "";
                 d[K(e.Path)] = e;
             }
             cache = d; stamp = now;
@@ -2302,9 +2323,9 @@ namespace WheelLauncher
             {
                 Directory.CreateDirectory(Paths.Root);
                 var sb = new StringBuilder();
-                sb.AppendLine("# path|pin|order|hidden|set|cat");
+                sb.AppendLine("# path|pin|order|hidden|set|cat|launch");
                 foreach (var e in All())
-                    sb.AppendLine(e.Path + "|" + (e.Pin ? "1" : "0") + "|" + e.Order + "|" + (e.Hidden ? "1" : "0") + "|" + (e.Set == null ? "auto" : e.Set) + "|" + (e.Cat == null ? "" : e.Cat));
+                    sb.AppendLine(e.Path + "|" + (e.Pin ? "1" : "0") + "|" + e.Order + "|" + (e.Hidden ? "1" : "0") + "|" + (e.Set == null ? "auto" : e.Set) + "|" + (e.Cat == null ? "" : e.Cat) + "|" + (e.Launch == null ? "" : e.Launch));
                 FileSafe.WriteAllText(file, sb.ToString());
                 stamp = File.GetLastWriteTimeUtc(file);
             }
@@ -2338,12 +2359,65 @@ namespace WheelLauncher
                 var mx = Get(x.Path); var my = Get(y.Path);
                 if (mx.Pin != my.Pin) return mx.Pin ? -1 : 1;
                 if (mx.Order != my.Order) return mx.Order.CompareTo(my.Order);
+                DateTime ux = Usage.LastOf(x.Path), uy = Usage.LastOf(y.Path);
+                bool rx = (DateTime.Now - ux).TotalDays <= 14.0, ry = (DateTime.Now - uy).TotalDays <= 14.0;
+                if (rx != ry) return rx ? -1 : 1;
+                if (rx && ry && ux != uy) return uy.CompareTo(ux);
                 char kx = KeyOf(x), ky = KeyOf(y);
                 if (kx != ky) return kx.CompareTo(ky);
                 return string.Compare(x.Name, y.Name, StringComparison.CurrentCulture);
             });
             return list;
         }
+    }
+    // 最近使用：记录每个条目最后一次启动时间，用来把常点/刚用过的往同字母组前面提
+    public static class Usage
+    {
+        static string file { get { return System.IO.Path.Combine(Paths.Root, "usage.txt"); } }
+        static readonly object Gate = new object();
+        static Dictionary<string, DateTime> map;
+        static DateTime stamp = DateTime.MinValue;
+
+        static void Ensure()
+        {
+            var now = File.Exists(file) ? File.GetLastWriteTimeUtc(file) : DateTime.MinValue;
+            if (map != null && now == stamp) return;
+            var d = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+            foreach (var raw in (FileSafe.Lines(file) ?? new string[0]))
+            {
+                var p = raw.Split('|');
+                if (p.Length < 2) continue;
+                long ticks;
+                if (long.TryParse(p[1], out ticks) && ticks > 0 && ticks <= DateTime.MaxValue.Ticks)
+                    d[p[0]] = new DateTime(ticks, DateTimeKind.Local);
+            }
+            map = d; stamp = now;
+        }
+
+        public static DateTime LastOf(string path)
+        {
+            lock (Gate) { Ensure(); DateTime t; return (path != null && map.TryGetValue(path, out t)) ? t : DateTime.MinValue; }
+        }
+
+        public static void Touch(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return;
+            try
+            {
+                lock (Gate)
+                {
+                    Ensure();
+                    map[path] = DateTime.Now;
+                    var sb = new StringBuilder();
+                    foreach (var kv in map) sb.AppendLine(kv.Key + "|" + kv.Value.Ticks);
+                    FileSafe.WriteAllText(file, sb.ToString());
+                    stamp = File.Exists(file) ? File.GetLastWriteTimeUtc(file) : DateTime.MinValue;
+                }
+            }
+            catch (Exception ex) { Log.W("usage touch failed: " + ex.Message); }
+        }
+
+        public static void Invalidate() { lock (Gate) { map = null; stamp = DateTime.MinValue; } }
     }
     public class AiProvider
     {
@@ -2372,6 +2446,49 @@ namespace WheelLauncher
             return d;
         }
 
+        // Key 落盘用 DPAPI 加密（绑当前 Windows 用户）：文件被拷走也解不开
+        const string EncPrefix = "enc:";
+
+        static string Enc(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            if (s.StartsWith(EncPrefix, StringComparison.Ordinal)) return s;
+            try
+            {
+                var raw = Encoding.UTF8.GetBytes(s);
+                var buf = ProtectedData.Protect(raw, null, DataProtectionScope.CurrentUser);
+                return EncPrefix + Convert.ToBase64String(buf);
+            }
+            catch (Exception ex) { Log.W("ai key encrypt failed: " + ex.Message); return s; }
+        }
+
+        static string Dec(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            if (!s.StartsWith(EncPrefix, StringComparison.Ordinal)) return s;
+            try
+            {
+                var raw = Convert.FromBase64String(s.Substring(EncPrefix.Length));
+                var buf = ProtectedData.Unprotect(raw, null, DataProtectionScope.CurrentUser);
+                return Encoding.UTF8.GetString(buf);
+            }
+            catch (Exception ex) { Log.W("ai key decrypt failed (other user or machine?): " + ex.Message); return ""; }
+        }
+
+        // 老版本保存的是明文 Key，启动时自动加密一遍
+        public static void Migrate()
+        {
+            try
+            {
+                bool any = false;
+                foreach (var p in Load())
+                    if (!string.IsNullOrEmpty(p.Key) && !p.Key.StartsWith(EncPrefix, StringComparison.Ordinal)) any = true;
+                if (any) { Save(); Log.W("ai key migrated to dpapi"); }
+            }
+            catch (Exception ex) { Log.W("ai migrate failed: " + ex.Message); }
+        }
+
+        public static void Invalidate() { list = null; }
         public static List<AiProvider> Load()
         {
             if (list != null) return list;
@@ -2387,7 +2504,7 @@ namespace WheelLauncher
                         if (p.Length < 3) continue;
                         var hit = d.Find(delegate (AiProvider x) { return string.Equals(x.Name, p[0], StringComparison.OrdinalIgnoreCase); });
                         if (hit == null) { hit = new AiProvider(); hit.Name = p[0]; d.Add(hit); }
-                        hit.Base = p[1]; hit.Model = p[2]; hit.Key = p.Length > 3 ? p[3] : "";
+                        hit.Base = p[1]; hit.Model = p[2]; hit.Key = Dec(p.Length > 3 ? p[3] : "");
                     }
             }
             catch { }
@@ -2402,7 +2519,7 @@ namespace WheelLauncher
                 var sb = new StringBuilder();
                 sb.AppendLine("# 名称|接口地址|模型|Key   （这一行是注释，可以直接编辑本文件）");
                 foreach (var p in Load())
-                    sb.AppendLine(p.Name + "|" + (p.Base ?? "") + "|" + (p.Model ?? "") + "|" + (p.Key ?? ""));
+                    sb.AppendLine(p.Name + "|" + (p.Base ?? "") + "|" + (p.Model ?? "") + "|" + Enc(p.Key ?? ""));
                 FileSafe.WriteAllText(file, sb.ToString());
             }
             catch (Exception ex) { Log.W("ai save failed: " + ex.Message); }
@@ -2985,6 +3102,7 @@ namespace WheelLauncher
         {
             try
             {
+                Usage.Touch(e.Path);
                 Log.W("launch name=" + e.Name + " path=" + e.Path + " args=" + e.Args);
                 if (e.Path != null && e.Path.StartsWith("shell:", StringComparison.OrdinalIgnoreCase))
                 {
@@ -2996,22 +3114,83 @@ namespace WheelLauncher
                     Process.Start(new ProcessStartInfo("explorer.exe", "\"" + e.Path + "\"") { UseShellExecute = true });
                     return;
                 }
-                if (WheelApp.IsElevated && Settings.LaunchAsUser && string.IsNullOrEmpty(e.Args) && File.Exists(e.Path))
+                // 启动方式：每个应用可在设置里单独指定（meta.txt 第 7 列 launch）
+                // "" 跟随全局 / user 标准用户 / admin 管理员（本程序已提权，直接继承，不再弹 UAC）
+                string mode = "";
+                try { var me = Meta.Get(e.Path); if (me != null && me.Launch != null) mode = me.Launch.Trim(); } catch { }
+                if (mode.Length > 0 && !string.Equals(mode, "user", StringComparison.OrdinalIgnoreCase))
                 {
-                    Log.W("launch as standard user via explorer");
-                    Process.Start(new ProcessStartInfo("explorer.exe", "\"" + e.Path + "\"") { UseShellExecute = true });
+                    var psiA = new ProcessStartInfo(e.Path);
+                    if (!string.IsNullOrEmpty(e.Args)) psiA.Arguments = e.Args;
+                    psiA.WorkingDirectory = StartDir(e);
+                    psiA.UseShellExecute = true;
+                    Log.W("launch admin mode wd=" + psiA.WorkingDirectory);
+                    Process.Start(psiA);
                     return;
                 }
-                var psi = new ProcessStartInfo(e.Path);
-                if (!string.IsNullOrEmpty(e.Args)) psi.Arguments = e.Args;
-                psi.WorkingDirectory = System.IO.Path.GetDirectoryName(e.Path);
-                psi.UseShellExecute = true;
-                Process.Start(psi);
+                bool wantUser = WheelApp.IsElevated && (string.Equals(mode, "user", StringComparison.OrdinalIgnoreCase) || (mode.Length == 0 && Settings.LaunchAsUser));
+                if (!wantUser)
+                {
+                    var psi = new ProcessStartInfo(e.Path);
+                    if (!string.IsNullOrEmpty(e.Args)) psi.Arguments = e.Args;
+                    psi.WorkingDirectory = StartDir(e);
+                    psi.UseShellExecute = true;
+                    Log.W("launch direct wd=" + psi.WorkingDirectory);
+                    Process.Start(psi);
+                    return;
+                }
+                // 标准用户：优先用它自己的快捷方式（工作目录/参数/兼容性设置都跟着走）；
+                // 没有快捷方式就临时造一个，保证工作目录正确（OBS 这类会报找不到 locale）
+                string use = null;
+                if (!string.IsNullOrEmpty(e.Shortcut) && File.Exists(e.Shortcut)) use = e.Shortcut;
+                else use = TempShortcut(e);
+                if (!string.IsNullOrEmpty(use) && File.Exists(use))
+                {
+                    Log.W("launch as standard user via lnk " + use);
+                    Process.Start(new ProcessStartInfo("explorer.exe", "\"" + use + "\"") { UseShellExecute = true });
+                    return;
+                }
+                Log.W("launch fallback explorer");
+                Process.Start(new ProcessStartInfo("explorer.exe", "\"" + e.Path + "\"") { UseShellExecute = true });
             }
             catch (Exception ex) { Log.W("launch failed: " + ex.Message); }
         }
-    }
 
+        static string StartDir(AppEntry e)
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(e.WorkDir) && Directory.Exists(e.WorkDir)) return e.WorkDir;
+                string d = System.IO.Path.GetDirectoryName(e.Path);
+                if (!string.IsNullOrEmpty(d) && Directory.Exists(d)) return d;
+            }
+            catch { }
+            return "";
+        }
+
+        // 没有桌面快捷方式时，临时造一个（带正确工作目录与参数），用 explorer 以标准用户启动
+        static string TempShortcut(AppEntry e)
+        {
+            try
+            {
+                string dir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "wl-lnk");
+                Directory.CreateDirectory(dir);
+                string key = Math.Abs((e.Path + "|" + (e.Args ?? "")).GetHashCode()).ToString("x8");
+                string lnk = System.IO.Path.Combine(dir, "app_" + key + ".lnk");
+                object shell = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell"));
+                dynamic sc = shell.GetType().InvokeMember("CreateShortcut", System.Reflection.BindingFlags.InvokeMethod, null, shell, new object[] { lnk });
+                sc.TargetPath = e.Path;
+                if (!string.IsNullOrEmpty(e.Args)) sc.Arguments = e.Args;
+                string wd = StartDir(e);
+                if (wd.Length > 0) sc.WorkingDirectory = wd;
+                sc.Save();
+                try { if (Marshal.IsComObject(sc)) Marshal.ReleaseComObject(sc); } catch { }
+                try { if (Marshal.IsComObject(shell)) Marshal.ReleaseComObject(shell); } catch { }
+                return lnk;
+            }
+            catch (Exception ex) { Log.W("temp shortcut failed: " + ex.Message); return null; }
+        }
+    }
     public static class Native
     {
         public const int WH_MOUSE_LL = 14, WH_KEYBOARD_LL = 13;
@@ -3442,6 +3621,9 @@ namespace WheelLauncher
 
         static Dictionary<string, string> mem;
         static DateTime memStamp = DateTime.MinValue;
+
+        // 导入配置后要让 ini 缓存失效，否则还会读到旧值
+        public static void Invalidate() { mem = null; memStamp = DateTime.MinValue; }
 
         static int GetInt(string key, int def)
         {
@@ -4826,7 +5008,16 @@ namespace WheelLauncher
                 VerticalAlignment = VerticalAlignment.Center,
                 Foreground = new SolidColorBrush(Ui.MutedCol)
             };
-            var bClose = Ui.MkButton("关闭", false);
+            var bExp = Ui.MkButton("导出配置", false);
+            var bImp = Ui.MkButton("导入配置", false);
+            bExp.Height = 34; bImp.Height = 34;
+            bExp.MinWidth = 88; bImp.MinWidth = 88;
+            bExp.VerticalAlignment = VerticalAlignment.Center; bImp.VerticalAlignment = VerticalAlignment.Center;
+            bExp.Margin = new Thickness(8, 0, 0, 0); bImp.Margin = new Thickness(8, 0, 0, 0);
+            bExp.Click += delegate { ExportConfig(); };
+            bImp.Click += delegate { ImportConfig(); };
+            DockPanel.SetDock(bExp, Dock.Right); DockPanel.SetDock(bImp, Dock.Right);
+            foot.Children.Add(bExp); foot.Children.Add(bImp);            var bClose = Ui.MkButton("关闭", false);
             bClose.MinWidth = 92; bClose.Height = 34;
             bClose.VerticalAlignment = VerticalAlignment.Center;
             bClose.Margin = new Thickness(12, 0, 0, 0);
@@ -4865,6 +5056,97 @@ Dispatcher.BeginInvoke(new Action(delegate
         Action<int> showPage;
         int curIdx;
 
+        // ── 配置导出 / 导入：打包 settings/meta/custom/games/rules，故意不含 ai.txt（密钥） ──
+        static string B64(string path)
+        {
+            try { return File.Exists(path) ? Convert.ToBase64String(File.ReadAllBytes(path)) : ""; } catch { return ""; }
+        }
+
+        static void PutB64(string path, string b64)
+        {
+            if (string.IsNullOrEmpty(b64)) return;
+            try { FileSafe.WriteAllText(path, Encoding.UTF8.GetString(Convert.FromBase64String(b64))); }
+            catch (Exception ex) { Log.W("import write failed " + System.IO.Path.GetFileName(path) + ": " + ex.Message); }
+        }
+
+        static string Ex(string key, string txt)
+        {
+            var m = System.Text.RegularExpressions.Regex.Match(txt, "\"" + key + "\"\\s*:\\s*\"([A-Za-z0-9+/=]*)\"");
+            return m.Success ? m.Groups[1].Value : "";
+        }
+
+        public static bool ExportTo(string path, out string msg)
+        {
+            var sb = new StringBuilder();
+            sb.Append("{\n");
+            sb.Append("  \"app\": \"WheelLauncher\",\n");
+            sb.Append("  \"version\": 1,\n");
+            sb.Append("  \"exported\": \"" + DateTime.Now.ToString("s") + "\",\n");
+            sb.Append("  \"note\": \"不含 ai.txt（里面是 API Key）\",\n");
+            sb.Append("  \"settings\": \"" + B64(Settings.IniFile) + "\",\n");
+            sb.Append("  \"meta\": \"" + B64(System.IO.Path.Combine(Paths.Root, "meta.txt")) + "\",\n");
+            sb.Append("  \"custom\": \"" + B64(System.IO.Path.Combine(Paths.Root, "custom.txt")) + "\",\n");
+            sb.Append("  \"games\": \"" + B64(System.IO.Path.Combine(Paths.Root, "games.txt")) + "\",\n");
+            sb.Append("  \"rules\": \"" + B64(System.IO.Path.Combine(Paths.Root, "rules.txt")) + "\"\n");
+            sb.Append("}\n");
+            try
+            {
+                File.WriteAllText(path, sb.ToString(), new UTF8Encoding(false));
+                Log.W("config exported to " + path);
+                msg = path; return true;
+            }
+            catch (Exception ex) { msg = ex.Message; return false; }
+        }
+
+        public void ExportConfig()
+        {
+            var dlg = new Microsoft.Win32.SaveFileDialog();
+            dlg.Filter = "配置文件 (*.json)|*.json";
+            dlg.FileName = "WheelLauncher-config-" + DateTime.Now.ToString("yyyyMMdd") + ".json";
+            if (dlg.ShowDialog() != true) return;
+            string msg;
+            if (ExportTo(dlg.FileName, out msg)) MessageBox.Show("已导出到：\n" + dlg.FileName + "\n\n（不含 API Key）", "轮盘启动器");
+            else MessageBox.Show("导出失败：" + msg, "轮盘启动器");
+        }
+
+        public static bool ImportFrom(string path, out string msg)
+        {
+            try
+            {
+                var txt = File.ReadAllText(path, Encoding.UTF8);
+                if (!txt.Contains("\"WheelLauncher\"")) { msg = "不是本程序的配置文件"; return false; }
+                PutB64(Settings.IniFile, Ex("settings", txt));
+                PutB64(System.IO.Path.Combine(Paths.Root, "meta.txt"), Ex("meta", txt));
+                PutB64(System.IO.Path.Combine(Paths.Root, "custom.txt"), Ex("custom", txt));
+                PutB64(System.IO.Path.Combine(Paths.Root, "games.txt"), Ex("games", txt));
+                PutB64(System.IO.Path.Combine(Paths.Root, "rules.txt"), Ex("rules", txt));
+                Settings.Invalidate(); Meta.Invalidate(); Usage.Invalidate();
+                Log.W("config imported from " + path);
+                msg = path; return true;
+            }
+            catch (Exception ex) { msg = ex.Message; return false; }
+        }
+
+        public void ImportConfig()
+        {
+            var dlg = new Microsoft.Win32.OpenFileDialog();
+            dlg.Filter = "配置文件 (*.json)|*.json";
+            if (dlg.ShowDialog() != true) return;
+            string msg;
+            if (!ImportFrom(dlg.FileName, out msg)) { MessageBox.Show("导入失败：" + msg, "轮盘启动器"); return; }
+            if (MessageBox.Show("配置已导入。重启程序后全部生效，现在重启吗？", "轮盘启动器", MessageBoxButton.YesNo) == MessageBoxResult.Yes) RestartSelf();
+        }
+
+        void RestartSelf()
+        {
+            try
+            {
+                var exe = System.Diagnostics.Process.GetCurrentProcess().MainModule.FileName;
+                Process.Start(new ProcessStartInfo(exe, "--elevated-restart") { UseShellExecute = true });
+            }
+            catch (Exception ex) { Log.W("restart failed: " + ex.Message); }
+            Application.Current.Shutdown();
+        }
         public void ShowPage(int i)
         {
             if (showPage != null) showPage(i);
@@ -5435,7 +5717,7 @@ Dispatcher.BeginInvoke(new Action(delegate
             panel.Children.Add(footRow);
 
             lvWheel = new ListView { Margin = new Thickness(12, 0, 12, 0), Background = new SolidColorBrush(Ui.CardCol), BorderThickness = new Thickness(0), FontSize = 12.5, Padding = new Thickness(2, 2, 2, 2) };
-            ScrollViewer.SetHorizontalScrollBarVisibility(lvWheel, ScrollBarVisibility.Auto);
+            ScrollViewer.SetHorizontalScrollBarVisibility(lvWheel, ScrollBarVisibility.Disabled);
             var gv = new GridView();
             gv.Columns.Add(new GridViewColumn { Header = "名称", Width = 218, DisplayMemberBinding = new System.Windows.Data.Binding("Name") });
             gv.Columns.Add(new GridViewColumn { Header = "类型", Width = 58, DisplayMemberBinding = new System.Windows.Data.Binding("Kind") });
@@ -5460,7 +5742,15 @@ Dispatcher.BeginInvoke(new Action(delegate
             miDown.Click += delegate { MoveSel(1); };
             var miHide = new MenuItem { Header = "隐藏 / 取消隐藏" };
             miHide.Click += delegate { ToggleHide(); };
+            var miLnkFollow = new MenuItem { Header = "启动方式：跟随全局" };
+            miLnkFollow.Click += delegate { SetLaunchMode(""); };
+            var miLnkUser = new MenuItem { Header = "启动方式：标准用户（推荐）" };
+            miLnkUser.Click += delegate { SetLaunchMode("user"); };
+            var miLnkAdmin = new MenuItem { Header = "启动方式：管理员" };
+            miLnkAdmin.Click += delegate { SetLaunchMode("admin"); };
             cmw.Items.Add(miPin); cmw.Items.Add(miUp); cmw.Items.Add(miDown); cmw.Items.Add(miHide);
+            cmw.Items.Add(new Separator());
+            cmw.Items.Add(miLnkFollow); cmw.Items.Add(miLnkUser); cmw.Items.Add(miLnkAdmin);
             lvWheel.ContextMenu = cmw;
             lvWheel.MouseDoubleClick += delegate { TogglePin(); };
             lvWheel.View = gv;
@@ -5547,6 +5837,17 @@ var cornerPatch = new System.Windows.Shapes.Rectangle
             Changed = true; ReloadWheel();
         }
 
+        // 设置某个应用的启动方式："" 跟随全局 / user 标准用户 / admin 管理员
+        void SetLaunchMode(string mode)
+        {
+            var row = SelRow();
+            if (row == null) return;
+            Meta.Update(row.Path, delegate (MetaEntry me) { me.Launch = mode; });
+            Changed = true;
+            if (Reloaded != null) Reloaded();
+            ReloadWheel();
+            Log.W("launch mode " + (mode.Length == 0 ? "follow" : mode) + " -> " + row.Path);
+        }
         void ToggleHide()
         {
             var r = SelRow();
@@ -5705,7 +6006,7 @@ var cornerPatch = new System.Windows.Shapes.Rectangle
             panel.Children.Add(footRow);
 
             lvGame = new ListView { Margin = new Thickness(12, 0, 12, 0), Background = new SolidColorBrush(Ui.CardCol), BorderThickness = new Thickness(0), FontSize = 12.5, Padding = new Thickness(2, 2, 2, 2) };
-            ScrollViewer.SetHorizontalScrollBarVisibility(lvGame, ScrollBarVisibility.Auto);
+            ScrollViewer.SetHorizontalScrollBarVisibility(lvGame, ScrollBarVisibility.Disabled);
             var gv = new GridView();
             gv.Columns.Add(new GridViewColumn { Header = "名称", Width = 218, DisplayMemberBinding = new System.Windows.Data.Binding("Name") });
             gv.Columns.Add(new GridViewColumn { Header = "判定方式", Width = 112, DisplayMemberBinding = new System.Windows.Data.Binding("Source") });
@@ -6602,6 +6903,8 @@ var cornerPatch = new System.Windows.Shapes.Rectangle
         {
             base.OnStartup(e);
             MouseHook.AcceptInjected = e.Args.Contains("--accept-injected");
+            AiStore.Migrate();   // 老版本明文 Key 自动转 DPAPI 加密
+
             // 调试口：--gametest=<pid> 直接判定某进程是不是游戏（不看前台），用于验证商店/加速器排除规则
             foreach (var ga in e.Args)
             {
@@ -6610,6 +6913,16 @@ var cornerPatch = new System.Windows.Shapes.Rectangle
                 if (ga.StartsWith("--search=", StringComparison.OrdinalIgnoreCase)) { dbgSearch = true; dbgSearchText = ga.Substring(9); }
                 // 测试副本专用：不抢生产实例的全局热键（否则生产实例重试用尽会一直拿不到 F7/F8）
                 if (string.Equals(ga, "--nohotkeys", StringComparison.OrdinalIgnoreCase)) noHotkeys = true;
+                if (ga.StartsWith("--exportconfig=", StringComparison.OrdinalIgnoreCase))
+                {
+                    string em; bool eok = WheelSettingsWindow.ExportTo(ga.Substring("--exportconfig=".Length), out em);
+                    Log.W("exportconfig ok=" + eok + " " + em);
+                }
+                if (ga.StartsWith("--importconfig=", StringComparison.OrdinalIgnoreCase))
+                {
+                    string im; bool iok = WheelSettingsWindow.ImportFrom(ga.Substring("--importconfig=".Length), out im);
+                    Log.W("importconfig ok=" + iok + " " + im);
+                }
                 if (ga.StartsWith("--gametest=", StringComparison.OrdinalIgnoreCase))
                 {
                     int gp;
@@ -6742,6 +7055,12 @@ var cornerPatch = new System.Windows.Shapes.Rectangle
                 try { if (!Settings.FoldersSeeded) { AutoFolders.EnsureDefaults(); Settings.FoldersSeeded = true; } } catch { }
             }
             apps = Scanner.FromDesktop();
+            foreach (var gd in e.Args)
+            {
+                if (gd != "--dumpapps") continue;
+                foreach (var da in apps) Log.W("dump name=" + da.Name + " sc=" + (da.Shortcut == null ? "-" : da.Shortcut) + " wd=" + (da.WorkDir == null ? "-" : da.WorkDir));
+                Log.W("dump done apps=" + apps.Count);
+            }
 
             try
             {
