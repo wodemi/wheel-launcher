@@ -4381,6 +4381,8 @@ namespace WheelLauncher
         TextBlock subText;
         public double cx, cy;
         public double hubRadius; double winScale = 1; Ellipse hubHotRing;         public bool HubSelected { get; private set; }
+        AppEntry hubBack;                       // 从哪一块走到中心齿轮的，按方向可以退回
+        public bool KbHubPending;               // KbStep 判定"这次该去中心设置"
         public double AngleDegRing(Ring ring, int idx)
         {
             double a = -90 + RingOffset(ring.Index) * 180.0 / Math.PI + 360.0 * idx / ring.Capacity;
@@ -4421,6 +4423,7 @@ namespace WheelLauncher
         // 键盘/手柄把中心「设置」选中
         public void HoverHub()
         {
+            if (hovered != null) hubBack = hovered;   // 记住来路，从齿轮按方向能退回去
             UpdateHover((int)Math.Round((Left + cx) * winScale), (int)Math.Round((Top + cy) * winScale), winScale);
         }
         public List<AppEntry> AllItems()
@@ -4830,31 +4833,43 @@ namespace WheelLauncher
             return a;
         }
 
-        // 指哪打哪：按方向（屏幕坐标，x 右 y 下）选最贴近该射线的图标；同一方向再按一次换到下一环
-        // 指哪打哪：按方向（屏幕坐标，x 右 y 下）选最贴近该射线的图标；
-        // 同一方向再按一次 → 在这条射线的候选里顺序切下一个（单调循环，不会来回跳）
-        // 空间邻接移动（摇杆语义）：从当前选中项出发，沿按下的方向找"最近的邻居"
+        // 圆盘 WASD：按实际画出来的位置做几何相邻，跟方格面板一个思路——
+        // 挑"方向对、又最近"的那一块（score = along + 1.8*perp，只看前方 60° 内），
+        // 中心齿轮就是圆心那一块，也参与比较，所以从附近往左/上按就能落到设置上。
+        // 前面 60° 内什么都没有就停住（不换环、不跳到背后去）。
         public AppEntry KbStep(double dx, double dy)
         {
             if (rings == null || rings.Count == 0) return null;
             if (dx == 0 && dy == 0) return null;
-            if (hovered == null) return KbPoint(dx, dy);      // 还没选中：先按方向指一个
+            KbHubPending = false;
             double len = Math.Sqrt(dx * dx + dy * dy);
             double ux = dx / len, uy = dy / len;
 
-            double px = 0, py = 0; bool have = false;
-            for (int i = 0; i < rings.Count && !have; i++)
-            {
-                int j = rings[i].Items.IndexOf(hovered);
-                if (j < 0) continue;
-                double a = -Math.PI / 2 + RingOffset(rings[i].Index) + 2 * Math.PI * j / rings[i].Capacity;
-                px = cx + rings[i].Radius * Math.Cos(a);
-                py = cy + rings[i].Radius * Math.Sin(a);
-                have = true;
-            }
-            if (!have) return KbPoint(dx, dy);
+            double px = 0, py = 0;
+            bool haveSelf = hovered != null && PosOf(hovered, out px, out py);
+            if (DumpXy) Log.W("kbd bg rings=" + (rings == null ? -1 : rings.Count) + " self=" + (hovered == null ? "null" : hovered.Name) + " have=" + haveSelf + " px=" + (int)px + " py=" + (int)py + " hub=" + HubSelected);
+            if (hovered == null) { px = 0; py = 0; haveSelf = HubSelected; }   // 站在齿轮上：从圆心出发
 
-            AppEntry best = null; double bestScore = 9e9;
+            AppEntry best = null; double bestScore = 9e9; bool bestHub = false;
+
+            // 候选一：中心齿轮（圆心）
+            if (!HubSelected && haveSelf && (px * px + py * py) > 1)
+            {
+                double vx = -px, vy = -py;
+                double dist = Math.Sqrt(vx * vx + vy * vy);
+                double along = vx * ux + vy * uy;
+                if (along > 0)
+                {
+                    double perp = Math.Abs(-vy * ux + vx * uy);
+                    if (perp <= along * 1.732)                   // 前方 60° 内
+                    {
+                        double sc = along + 1.8 * perp;
+                        if (sc < bestScore) { bestScore = sc; best = null; bestHub = true; }
+                    }
+                }
+            }
+
+            // 候选二：所有瓦片
             for (int i = 0; i < rings.Count; i++)
             {
                 var ring = rings[i];
@@ -4863,21 +4878,48 @@ namespace WheelLauncher
                     var it = ring.Items[j];
                     if (ReferenceEquals(it, hovered)) continue;
                     double a = -Math.PI / 2 + RingOffset(ring.Index) + 2 * Math.PI * j / ring.Capacity;
-                    double qx = cx + ring.Radius * Math.Cos(a);
-                    double qy = cy + ring.Radius * Math.Sin(a);
+                    double qx = ring.Radius * Math.Cos(a);        // 与 PosOf 一致，都是相对圆心的坐标
+                    double qy = ring.Radius * Math.Sin(a);
                     double vx2 = qx - px, vy2 = qy - py;
                     double dist = Math.Sqrt(vx2 * vx2 + vy2 * vy2);
                     if (dist < 1) continue;
                     double along = vx2 * ux + vy2 * uy;
-                    if (along <= 0) continue;                        // 只往前
+                    if (along <= 0) continue;                     // 只往前
                     double perp = Math.Abs(-vy2 * ux + vx2 * uy);
-                    double ang = Math.Atan2(perp, along);             // 与按键方向的夹角（弧度）
-                    if (ang > 1.20) continue;                         // 超过约 69° 不算这个方向
-                    double score = dist * (1.0 + 2.0 * ang);          // 近的优先；偏得越多打折越狠
-                    if (score < bestScore) { bestScore = score; best = it; }
+                    if (perp > along * 1.732) continue;           // 前方 60° 内才算这个方向
+                    double sc = along + 1.8 * perp;               // 方向正、距离近的优先
+                    if (sc < bestScore) { bestScore = sc; best = it; bestHub = false; }
                 }
             }
-            return best;
+
+            if (bestHub)
+            {
+                if (hovered != null) hubBack = hovered;           // 记住来路
+                KbHubPending = true;
+                return null;
+            }
+            if (best != null) return best;
+
+            // 站在齿轮上、这个方向前面什么都没有：退回刚才那一块，别把人卡住
+            if (HubSelected && hubBack != null) { var back = hubBack; hubBack = null; return back; }
+            return null;
+        }
+
+        // 条目相对圆心的位置（y 向下），键盘导航判断方向用
+        bool PosOf(AppEntry e, out double px, out double py)
+        {
+            px = 0; py = 0;
+            if (e == null || rings == null) return false;
+            for (int i = 0; i < rings.Count; i++)
+            {
+                int j = rings[i].Items.IndexOf(e);
+                if (j < 0) continue;
+                double a = -Math.PI / 2 + RingOffset(rings[i].Index) + 2 * Math.PI * j / rings[i].Capacity;
+                px = rings[i].Radius * Math.Cos(a);
+                py = rings[i].Radius * Math.Sin(a);
+                return true;
+            }
+            return false;
         }
 
         public AppEntry KbPoint(double vx, double vy)
@@ -7551,6 +7593,37 @@ var cornerPatch = new System.Windows.Shapes.Rectangle
                 Log.W("clickicon at " + ix + "," + iy + " ring=" + rg.Radius.ToString("0.0") + " item=" + rg.Items[0].Name);
                 MouseHook.LeftClick(ix, iy);
             }); }), DispatcherPriority.Background); }
+            var pickArg = e.Args.FirstOrDefault(s => s.StartsWith("--pick="));
+            var thenArg = e.Args.FirstOrDefault(s => s.StartsWith("--then="));
+            if (pickArg != null || thenArg != null) DispatcherTimerOneShot(1400, delegate {
+                var ww = wheel;
+                if (pickArg != null && ww != null)
+                {
+                    string want = pickArg.Substring(7);
+                    bool found = false;
+                    foreach (var rg in ww.Rings) { foreach (var it in rg.Items) { if (it.Name == want) { ww.HoverItem(it); kbSel = it; found = true; Log.W("pick hit " + want + " ring=" + rg.Index); break; } } if (found) break; }
+                    if (!found) Log.W("pick miss " + want);
+                }
+                if (thenArg == null) return;
+                string seq = thenArg.Substring(7);
+                int k = 0;
+                Action step = delegate {
+                    if (k >= seq.Length) return;
+                    char c = seq[k++];
+                    int dx = 0, dy = 0;
+                    if (c == 'W') dy = -1; else if (c == 'S') dy = 1; else if (c == 'A') dx = -1; else if (c == 'D') dx = 1;
+                    if (dx == 0 && dy == 0) return;
+                    kbNav = true; kbAt = DateTime.Now;
+                    KbMove(dx, dy);
+                };
+                step();
+                var t2 = new DispatcherTimer(); t2.Interval = TimeSpan.FromMilliseconds(300);
+                t2.Tick += delegate {
+                    if (k >= seq.Length) { t2.Stop(); Log.W("then done " + seq); return; }
+                    step();
+                };
+                t2.Start();
+            });
             if (e.Args.Contains("--show2")) { Dispatcher.BeginInvoke(new Action(() => { var w = WF.Screen.PrimaryScreen.WorkingArea; ShowWheel(2, w.Width / 2, w.Height / 2, w.Width / 2 - 200, w.Height / 2); }), DispatcherPriority.Background); }
             if (e.Args.Contains("--show")) { Dispatcher.BeginInvoke(new Action(() => { var scr = WF.Screen.PrimaryScreen.WorkingArea; ShowWheel(0, scr.Width / 2, scr.Height / 2, scr.Width / 2, scr.Height / 2); }), DispatcherPriority.Background); }
 
@@ -8492,7 +8565,19 @@ static int Cap(double radius, double icon)
             if (dx == 0 && dy == 0) return;   // 摇杆/定时器可能传 0,0，别当作导航
             kbNav = true; { Native.POINT p0; Native.GetCursorPos(out p0); kbMx = p0.x; kbMy = p0.y; }
             var target = wheel.KbStep(dx, dy);
-            if (target == null) { Log.W("kb dir none dir=" + dx + "," + dy); return; }
+            if (target == null)
+            {
+                if (wheel.KbHubPending)                  // 朝中心按到底：选中中心「设置」
+                {
+                    wheel.KbHubPending = false;
+                    wheel.HoverHub();
+                    kbSel = null; kbGearHold = true;
+                    Log.W("kb dir hub dir=" + dx + "," + dy);
+                    lastAct = DateTime.Now;
+                    return;
+                }
+                Log.W("kb dir none dir=" + dx + "," + dy); return;
+            }
             var prevSel = kbSel;
             wheel.HoverItem(target);
             kbGearHold = false;
@@ -8513,7 +8598,7 @@ static int Cap(double radius, double icon)
                 return;
             }
             if (wheel == null) return;
-            if (wheel.HubSelected && kbSel == null) { Log.W("kb commit hub -> settings"); CloseWheel(); OpenWheelSettings(); return; }
+            if (wheel.HubSelected) { Log.W("kb commit hub -> settings"); CloseWheel(); OpenWheelSettings(); return; }
             var a = kbSel != null ? kbSel : wheel.Hovered;
             if (a == null) { Log.W("kb commit nothing -> close"); CloseWheel(); return; }
             CloseWheel();
