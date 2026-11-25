@@ -1918,7 +1918,7 @@ namespace WheelLauncher
         void DrawGroups(List<KeyValuePair<char, List<AppEntry>>> groups, double maxW, double maxH)
         {
             tiles.Clear(); caps.Clear(); tcx.Clear(); tcy.Clear();
-            lastIdx = -1; Hovered = null;   // 翻页后必须复位，否则松手会启动上一页同位置的条目
+            lastIdx = -1; Hovered = null; selIdx = -1; gearBack = -1;   // 翻页后必须复位，否则松手会启动上一页同位置的条目
             cv = new Canvas();
             Content = cv;
 
@@ -2122,9 +2122,39 @@ namespace WheelLauncher
         int lastIdx = -1;
         internal bool clampMode;
         Border gear;
+        // 当前选中的瓦片下标。不要再用 Items.IndexOf(Hovered) 反推：
+        // 瓦片顺序是「置顶组在前 + 按字母分组」，翻页后和 Items 下标完全对不上，起点会算到别的格子上。
+        int selIdx = -1;
+        int gearBack = -1;    // 从哪块瓦片跳到齿轮的，按方向键可以退回去
+        double GearCX { get { return contentW - 32; } }
+        double GearCY { get { return contentH - 32; } }
+
+        int TileIndex(AppEntry e)
+        {
+            if (e == null) return -1;
+            for (int i = 0; i < tiles.Count; i++) if (object.ReferenceEquals(tiles[i].Tag, e)) return i;
+            return -1;
+        }
+
+        // 离给定点最近的瓦片（跳过 exclude）；"还没选中过"和"从齿轮退回"都用它兜底
+        int NearestTile(double x, double y, int exclude)
+        {
+            int n = Math.Min(tcx.Count, tcy.Count);
+            int bi = -1; double bd = double.MaxValue;
+            for (int i = 0; i < n; i++)
+            {
+                if (i == exclude) continue;
+                double vx = tcx[i] - x, vy = tcy[i] - y;
+                double d = vx * vx + vy * vy;
+                if (d < bd) { bd = d; bi = i; }
+            }
+            return bi;
+        }
+
         void ApplyHit(int idx)
         {
-            if (idx >= 0) { gearSel = false; GearHot(false); }
+            if (idx >= 0) { selIdx = idx; gearBack = idx; gearSel = false; GearHot(false); }
+            else selIdx = -1;
             if (idx == lastIdx) return;
             lastIdx = idx;
             for (int i = 0; i < tiles.Count; i++)
@@ -2151,60 +2181,124 @@ namespace WheelLauncher
             }
         }
 
-        public void HoverItem(AppEntry e) { int i = Items.IndexOf(e); if (i >= 0) ApplyHit(i); }
+        public void HoverItem(AppEntry e) { int i = TileIndex(e); if (i >= 0) ApplyHit(i); }
 
+        // WASD / 方向键：纯几何语义。
+        //   W = 正上方那一块、A = 正左、S = 正下方、D = 正右；只认同排（水平键）或同列（垂直键）的最近一块。
+        //   到行首/行尾、列首/列尾就停住，不换行（用户 2026-11-26 定的）。
+        //   右下角齿轮也算一格：把齿轮在按键轴上投影到"最下面一行 / 最右一列"参与比较，
+        //   所以最下面一行按 D、最右一列按 S 都能走到齿轮，选中后 Enter 打开设置。
+        //   同时按住两个方向（W+D 等）时优先取该象限里真正斜着的那块。
+        //   还没选中过时从面板中心出发，一定会选出一块，避免"按了没反应"。
         public void Move(int dx, int dy)
         {
-            int nItem = Math.Min(Items.Count, Math.Min(tcx.Count, tcy.Count));
-            int cur = Hovered == null ? -1 : Items.IndexOf(Hovered);
-            if (cur >= nItem) cur = -1;
-            bool fromGear = gearSel;
-            bool fresh = cur < 0 && !fromGear;
-            double ox, oy;
-            if (fromGear) { ox = contentW - 32; oy = contentH - 32; }
-            else if (cur < 0) { ox = contentW / 2; oy = contentH / 2; }
-            else { ox = tcx[cur]; oy = tcy[cur]; }
+            if (dx == 0 && dy == 0) return;
+            int n = Math.Min(tcx.Count, tcy.Count);
+            if (n == 0) return;
 
-
-            double minDot = fresh ? 0.30 : 0.72;
-            double gearDot = fresh ? 0.30 : 0.60;
-            double bs = double.MaxValue; int bi = -1; bool bGear = false;
-
-            for (int pass = 0; pass < 2; pass++)
+            double bottomY = double.MinValue, rightX = double.MinValue;
+            for (int i = 0; i < n; i++)
             {
-                double md = pass == 0 ? minDot : 0.45;
-                double gd = pass == 0 ? gearDot : 0.40;
-                for (int i = 0; i < nItem; i++)
+                if (tcy[i] > bottomY) bottomY = tcy[i];
+                if (tcx[i] > rightX) rightX = tcx[i];
+            }
+
+            int cur = TileIndex(Hovered);
+
+            if (gearSel)
+            {
+                // 在齿轮上按方向：回到瓦片区。齿轮中心不在瓦片网格上，所以这里不设同排/同列限制，
+                // 只用"沿按键方向 + 偏离惩罚"打分，避免一按就卡在齿轮上出不来。
+                double glen = Math.Sqrt(dx * dx + dy * dy);
+                double gux = dx / glen, guy = dy / glen;
+                double gbest = double.MaxValue; int gbi = -1;
+                for (int i = 0; i < n; i++)
+                {
+                    double vx = tcx[i] - GearCX, vy = tcy[i] - GearCY;
+                    double along = vx * gux + vy * guy;
+                    if (along <= 1) continue;                 // 齿轮就在右下角，往右下按是没有目标的
+                    double perp = Math.Abs(-vy * gux + vx * guy);
+                    double s = along + 2.0 * perp;
+                    if (s < gbest) { gbest = s; gbi = i; }
+                }
+                if (gbi >= 0)
+                {
+                    gearSel = false; GearHot(false);
+                    Log.W("grid dir sel=" + ((AppEntry)tiles[gbi].Tag).Name + " dir=" + dx + "," + dy + " from gear");
+                    ApplyHit(gbi);
+                    return;
+                }
+                Log.W("grid dir none dir=" + dx + "," + dy + " at gear");   // 到头了，停在齿轮上
+                return;
+            }
+
+            bool first = cur < 0 || cur >= n;
+            double ox = first ? contentW / 2 : tcx[cur];
+            double oy = first ? contentH / 2 : tcy[cur];
+
+            double dlen = Math.Sqrt(dx * dx + dy * dy);
+            double ux = dx / dlen, uy = dy / dlen;
+            bool horiz = dy == 0, vert = dx == 0;
+            // 同排/同列的容差：半个瓦片。行距 = tH + gapY > tH，所以放宽到半个瓦片也不会串到相邻行
+            double band = horiz ? tH * 0.5 : tW * 0.5;
+
+            double best = double.MaxValue; int bi = -1;
+            int passes = (horiz || vert || first) ? 1 : 2;
+            for (int pass = 0; pass < passes && bi < 0; pass++)
+            {
+                for (int i = 0; i <= n; i++)          // i == n 表示右下角齿轮
                 {
                     if (i == cur) continue;
-                    double ux = tcx[i] - ox, uy = tcy[i] - oy;
-                    double l = Math.Sqrt(ux * ux + uy * uy); if (l < 1) continue;
-                    double dot = (ux * dx + uy * dy) / l;
-                    if (dot < md) continue;
-                    double s = fresh ? l / (dot * dot) : l / (dot * dot * dot);
-                    if (s < bs) { bs = s; bi = i; bGear = false; }
-                }
-                if (!fromGear)
-                {
-                    double ux = (contentW - 32) - ox, uy = (contentH - 32) - oy;
-                    double l = Math.Sqrt(ux * ux + uy * uy);
-                    if (l > 1)
+                    bool isGear = i == n;
+                    double cx, cy;
+                    if (isGear)
                     {
-                        double dot = (ux * dx + uy * dy) / l;
-                        if (dot >= gd)
-                        {
-                            double s = fresh ? l / (dot * dot) : l / (dot * dot * dot);
-                            if (s < bs) { bs = s; bGear = true; bi = -1; }
-                        }
+                        // 齿轮投影到按键轴上的"逻辑行/列"，这样它和瓦片一起按同排/同列比较
+                        cx = vert ? rightX : GearCX;
+                        cy = horiz ? bottomY : GearCY;
                     }
-                }
-                if (bGear || bi >= 0) break;
-            }
-            if (!bGear && bi < 0 && dx > 0 && dy > 0) { GearSelect(); return; }   // 右下方向且无其它候选 -> 选中设置
+                    else { cx = tcx[i]; cy = tcy[i]; }
 
-            if (bGear) { GearSelect(); return; }
-            if (bi >= 0) ApplyHit(bi);
+                    double vx = cx - ox, vy = cy - oy;
+                    double along = vx * ux + vy * uy;
+                    if (along <= 1) continue;                      // 必须在按键那一侧
+                    double perp = Math.Abs(-vy * ux + vx * uy);
+                    if (first)
+                    {
+                        // 第一次：允许偏一点，但越偏越不优先
+                        double s0 = along + 2.0 * perp;
+                        if (s0 < best) { best = s0; bi = i; }
+                        continue;
+                    }
+                    if (horiz || vert)
+                    {
+                        if (perp > band) continue;                 // 不同排/不同列 = 已经到头
+                        if (along < best) { best = along; bi = i; }
+                        continue;
+                    }
+                    if (pass == 0 && (Math.Abs(vx) < 1 || Math.Abs(vy) < 1)) continue;   // 斜向：先只要真正在象限里的
+                    double s1 = along + perp;
+                    if (s1 < best) { best = s1; bi = i; }
+                }
+            }
+
+            if (bi == n)
+            {
+                gearBack = cur;
+                GearSelect();                      // 内部 ApplyHit(-1) 并显示"设置"提示
+                Log.W("grid dir gear dir=" + dx + "," + dy);
+                return;
+            }
+            if (bi >= 0)
+            {
+                Log.W("grid dir sel=" + ((AppEntry)tiles[bi].Tag).Name + " dir=" + dx + "," + dy + (first ? " first" : ""));
+                ApplyHit(bi);
+                return;
+            }
+            Log.W("grid dir none dir=" + dx + "," + dy);
         }
+
+
 
         public void CursorMove(double nx, double ny)
         {
@@ -3838,10 +3932,12 @@ namespace WheelLauncher
         public static Action ChordRelease;
         public static Func<bool> WheelOpen;
         public static Func<int, int, bool> LeftClick;
+        public static Action GoHub;   // H 键：光标跳到中心齿轮
         public static Action<int> PageFlip;      // 滚轮 / 方括号 / 肩键翻页
         public static Action<int> HotkeyFire;
         // typing on the circular wheel jumps into search
         public static Func<string, bool> SearchOpen;
+        public static Action<int> DiscSwitch;   // 面板开着时 Tab+A / Tab+B 切换两盘
         public static System.Windows.Threading.Dispatcher UiDispatcher;
         static volatile bool wheelShown;
         static volatile bool swallowedDown;   // 已吞下左键按下 → 抬起也要吞，保证配对
@@ -4054,26 +4150,8 @@ namespace WheelLauncher
                             }
                         }
                         bool open = WheelOpen != null && WheelOpen();
-                        // typing on the circular wheel jumps into search (grid keeps its WASD nav)
-                        if (open && WheelWindow.Active != null && SearchOpen != null
-                            && (Native.GetAsyncKeyState(0x11) & 0x8000) == 0
-                            && (Native.GetAsyncKeyState(0x12) & 0x8000) == 0
-                            && (Native.GetAsyncKeyState(0x10) & 0x8000) == 0)
-                        {
-                            char ck = '\0';
-                            if (vk >= 0x41 && vk <= 0x5A) ck = (char)vk;
-                            else if (vk >= 0x30 && vk <= 0x39) ck = (char)vk;
-                            if (ck != '\0')
-                            {
-                                string seed = ck.ToString();
-                                var so = SearchOpen;
-                                System.Windows.Application.Current.Dispatcher.BeginInvoke(new Action(delegate
-                                {
-                                    try { so(seed); } catch (Exception exq) { Log.W("search from wheel failed: " + exq.Message); }
-                                }));
-                                return (IntPtr)1;
-                            }
-                        }
+                        // 搜索框只由 F9 / 托盘 / 和弦外的显式入口打开，面板开着时打字不再抢占键盘
+
                         if (vk == 0x09)
                         {
                             // Alt/Ctrl/Shift/Win + Tab 一律放行，否则 Alt+Tab 切窗口会被打断
@@ -4097,7 +4175,23 @@ namespace WheelLauncher
                             ChordUsed = false;
                             return (IntPtr)1;
                         }
-                        else if (open && (vk == 0x57 || vk == 0x53 || vk == 0x44 || vk == 0x41))
+                        else if (TabDown && (vk == 0x41 || vk == 0x42))
+                        {
+                            int which = vk == 0x41 ? 1 : 2;
+                            ChordFired = true;
+                            ChordUsed = true;
+                            TabDown = false;   // 用掉这次 Tab，避免 TabDown 卡死导致日后误触发
+                            if (open)
+                            {
+                                // 面板开着时，Tab+A / Tab+B 用来在 A–M 与 N–Z 之间切换，不再重复弹窗
+                                Log.W("hotkey tab+" + (which == 1 ? "A" : "B") + " -> switch disc");
+                                System.Windows.Application.Current.Dispatcher.BeginInvoke(new Action(() => { var ds = DiscSwitch; if (ds != null) { try { ds(which); } catch (Exception exd) { Log.W("disc switch failed: " + exd.Message); } } }));
+                                return (IntPtr)1;
+                            }
+                            Log.W("hotkey tab+" + (which == 1 ? "A" : "B"));
+                            System.Windows.Application.Current.Dispatcher.BeginInvoke(new Action(() => { var q = Quick; if (q != null) q(which); }));
+                            return (IntPtr)1;
+                        }                        else if (open && (vk == 0x57 || vk == 0x53 || vk == 0x44 || vk == 0x41))
                         {
                             WasdDown.Add(vk);
                             int ndx = 0, ndy = 0;
@@ -4108,7 +4202,7 @@ namespace WheelLauncher
                             System.Windows.Application.Current.Dispatcher.BeginInvoke(new Action(delegate { var kb = KbMove; if (kb != null) kb(ndx, ndy); }));
                             return (IntPtr)1;
                         }
-                        else if (open && vk == 0x42)
+                        else if (open && GridWindow.Active != null && vk == 0x42)
                         {
                             // 方格/圆形面板通用：B 键取消
                             System.Windows.Application.Current.Dispatcher.BeginInvoke(new Action(() => { var h = Escape; if (h != null) h(); }));
@@ -4125,17 +4219,13 @@ namespace WheelLauncher
                             System.Windows.Application.Current.Dispatcher.BeginInvoke(new Action(() => { var h = Escape; if (h != null) h(); }));
                             if (open) return (IntPtr)1;
                         }
-                        else if (TabDown && (vk == 0x41 || vk == 0x42))
+
+                        else if (open && vk == 0x48)   // H = 中心齿轮
                         {
-                            int which = vk == 0x41 ? 1 : 2;
-                            ChordFired = true;
-                            ChordUsed = true;
-                            TabDown = false;   // 用掉这次 Tab，避免 TabDown 卡死导致日后误触发
-                            if (open) { Log.W("hotkey tab+" + (which == 1 ? "A" : "B") + " ignored (wheel already open)"); return (IntPtr)1; }
-                            Log.W("hotkey tab+" + (which == 1 ? "A" : "B"));
-                            System.Windows.Application.Current.Dispatcher.BeginInvoke(new Action(() => { var q = Quick; if (q != null) q(which); }));
+                            System.Windows.Application.Current.Dispatcher.BeginInvoke(new Action(delegate { var gh = GoHub; if (gh != null) gh(); }));
                             return (IntPtr)1;
                         }
+
                         else if (vk == 0x0D && open)
                         {
                             System.Windows.Application.Current.Dispatcher.BeginInvoke(new Action(() => { var c = CommitKey; if (c != null) c(); }));
@@ -4262,6 +4352,7 @@ namespace WheelLauncher
 
     public class WheelWindow : Window
     {
+        public static bool DumpXy;
         public static bool ShotMode;
 
         // 所有活动轮盘窗口的登记表：CloseWheel 若因异常没能关掉，下一次显示/急救键还能把它清掉，
@@ -4313,9 +4404,18 @@ namespace WheelLauncher
         }
         public void HoverItem(AppEntry hit)
         {
-            double px, py;
-            if (!TryPos(hit, out px, out py)) return;
-            UpdateHover((int)Math.Round((Left + cx + px) * winScale), (int)Math.Round((Top + cy + py) * winScale), winScale);
+            if (hit == null) return;
+            for (int i = 0; i < rings.Count; i++)
+            {
+                if (rings[i].Items.IndexOf(hit) < 0) continue;
+                hovered = hit;
+                HubSelected = false;
+                if (hubHotRing != null) hubHotRing.Visibility = Visibility.Collapsed;
+                Click.Tick(i);
+                lastHit = hit; lastHitAt = DateTime.Now;
+                ApplyHoverVisual(hit, i);
+                return;
+            }
         }
 
         // 键盘/手柄把中心「设置」选中
@@ -4518,6 +4618,7 @@ namespace WheelLauncher
                     double ang = -Math.PI / 2 + RingOffset(ring.Index) + 2 * Math.PI * j / ring.Capacity;
                     double x = cx + ring.Radius * Math.Cos(ang);
                     double y = cy + ring.Radius * Math.Sin(ang);
+                    if (DumpXy) Log.W("xy name=" + ring.Items[j].Name + " x=" + (int)x + " y=" + (int)y + " ring=" + ring.Index);
 
                     var slot = new Ellipse
                     {
@@ -4695,7 +4796,134 @@ namespace WheelLauncher
             }
         }
 
+        void ApplyHoverVisual(AppEntry hit, int ringIdx)
+        {
+            try
+            {
+                if (hit == null) return;
+                var ring = rings[ringIdx];
+                int idx = ring.Items.IndexOf(hit);
+                if (idx < 0) return;
+                double ang = -Math.PI / 2 + RingOffset(ring.Index) + 2 * Math.PI * idx / ring.Capacity;
+                double px = cx + ring.Radius * Math.Cos(ang);
+                double py = cy + ring.Radius * Math.Sin(ang);
+                Canvas.SetLeft(highlight, px - highlight.Width / 2);
+                Canvas.SetTop(highlight, py - highlight.Height / 2);
+                highlight.Visibility = Visibility.Visible;
+                centerText.Text = hit.Name;
+                centerText.FontSize = Math.Max(12, Math.Min(17, hubRadius * 0.42));
+                centerText.Foreground = new SolidColorBrush(Color.FromArgb(255, 255, 246, 205));
+                Canvas.SetTop(centerText, cy - centerText.FontSize * 0.62);
+                bottomText.Text = hit.Name;
+                bottomBar.Visibility = Visibility.Visible;
+                bottomBar.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+                double bw = bottomBar.DesiredSize.Width, bh = bottomBar.DesiredSize.Height;
+                Canvas.SetLeft(bottomBar, cx - bw / 2);
+                Canvas.SetTop(bottomBar, cy + r0 + iconSize * 0.55 - bh / 2);
+            }
+            catch (Exception ex) { Log.W("hover visual failed: " + ex.Message); }
+        }
+        static double WrapPi(double a)
+        {
+            while (a > Math.PI) a -= 2 * Math.PI;
+            while (a < -Math.PI) a += 2 * Math.PI;
+            return a;
+        }
+
+        // 指哪打哪：按方向（屏幕坐标，x 右 y 下）选最贴近该射线的图标；同一方向再按一次换到下一环
+        // 指哪打哪：按方向（屏幕坐标，x 右 y 下）选最贴近该射线的图标；
+        // 同一方向再按一次 → 在这条射线的候选里顺序切下一个（单调循环，不会来回跳）
+        // 空间邻接移动（摇杆语义）：从当前选中项出发，沿按下的方向找"最近的邻居"
+        public AppEntry KbStep(double dx, double dy)
+        {
+            if (rings == null || rings.Count == 0) return null;
+            if (dx == 0 && dy == 0) return null;
+            if (hovered == null) return KbPoint(dx, dy);      // 还没选中：先按方向指一个
+            double len = Math.Sqrt(dx * dx + dy * dy);
+            double ux = dx / len, uy = dy / len;
+
+            double px = 0, py = 0; bool have = false;
+            for (int i = 0; i < rings.Count && !have; i++)
+            {
+                int j = rings[i].Items.IndexOf(hovered);
+                if (j < 0) continue;
+                double a = -Math.PI / 2 + RingOffset(rings[i].Index) + 2 * Math.PI * j / rings[i].Capacity;
+                px = cx + rings[i].Radius * Math.Cos(a);
+                py = cy + rings[i].Radius * Math.Sin(a);
+                have = true;
+            }
+            if (!have) return KbPoint(dx, dy);
+
+            AppEntry best = null; double bestScore = 9e9;
+            for (int i = 0; i < rings.Count; i++)
+            {
+                var ring = rings[i];
+                for (int j = 0; j < ring.Items.Count; j++)
+                {
+                    var it = ring.Items[j];
+                    if (ReferenceEquals(it, hovered)) continue;
+                    double a = -Math.PI / 2 + RingOffset(ring.Index) + 2 * Math.PI * j / ring.Capacity;
+                    double qx = cx + ring.Radius * Math.Cos(a);
+                    double qy = cy + ring.Radius * Math.Sin(a);
+                    double vx2 = qx - px, vy2 = qy - py;
+                    double dist = Math.Sqrt(vx2 * vx2 + vy2 * vy2);
+                    if (dist < 1) continue;
+                    double along = vx2 * ux + vy2 * uy;
+                    if (along <= 0) continue;                        // 只往前
+                    double perp = Math.Abs(-vy2 * ux + vx2 * uy);
+                    double ang = Math.Atan2(perp, along);             // 与按键方向的夹角（弧度）
+                    if (ang > 1.20) continue;                         // 超过约 69° 不算这个方向
+                    double score = dist * (1.0 + 2.0 * ang);          // 近的优先；偏得越多打折越狠
+                    if (score < bestScore) { bestScore = score; best = it; }
+                }
+            }
+            return best;
+        }
+
+        public AppEntry KbPoint(double vx, double vy)
+        {
+            if (rings == null || rings.Count == 0) return null;
+            if (vx == 0 && vy == 0) return null;
+            double target = Math.Atan2(vy, vx);
+
+            var cands = new List<AppEntry>();
+            var dels = new List<double>();
+            var ringsOf = new List<int>();
+            for (int i = 0; i < rings.Count; i++)
+            {
+                var ring = rings[i];
+                for (int j = 0; j < ring.Items.Count; j++)
+                {
+                    double ang = -Math.PI / 2 + RingOffset(ring.Index) + 2 * Math.PI * j / ring.Capacity;
+                    double d = Math.Abs(WrapPi(ang - target));
+                    if (d > 0.30) continue;             // 只收夹角 17° 内的候选
+                    cands.Add(ring.Items[j]); dels.Add(d); ringsOf.Add(i);
+                }
+            }
+            if (cands.Count == 0) return null;
+
+            // 按「夹角小优先，其次内环优先」排序
+            var order = new List<int>();
+            for (int k = 0; k < cands.Count; k++) order.Add(k);
+            order.Sort(delegate (int a, int b)
+            {
+                int c = dels[a].CompareTo(dels[b]);
+                return c != 0 ? c : ringsOf[a].CompareTo(ringsOf[b]);
+            });
+
+            int pick = 0;   // 只取最贴近方向的那一个：连按同一方向不移动、不切换
+            var chosen = cands[order[pick]];
+            for (int i = 0; i < rings.Count; i++)
+            {
+                int j = rings[i].Items.IndexOf(chosen);
+                if (j < 0) continue;
+                LastPointDeg = (-Math.PI / 2 + RingOffset(rings[i].Index) + 2 * Math.PI * j / rings[i].Capacity) * 180 / Math.PI;
+                break;
+            }
+            return chosen;
+        }
         public AppEntry Hovered { get { return hovered; } }
+        public double LastPointDeg;
         public double Reach { get { return reach; } }
         public void ResetReach() { reach = 0; }
         public double HubRadius { get { return hubRadius; } }
@@ -4730,6 +4958,62 @@ namespace WheelLauncher
             return Math.Sqrt(x * x + y * y) <= hubRadius * 1.12;
         }
 
+        // ---- 键盘导航（圆盘）：按环/槽移动 ----
+        public AppEntry KbNext(int dir)
+        {
+            try
+            {
+                if (rings == null || rings.Count == 0) return null;
+                int ri = -1, idx = -1;
+                for (int i = 0; i < rings.Count && ri < 0; i++)
+                {
+                    int j = hovered == null ? -1 : rings[i].Items.IndexOf(hovered);
+                    if (j >= 0) { ri = i; idx = j; }
+                }
+                if (ri < 0) { ri = 0; idx = dir > 0 ? -1 : 0; }
+                var ring = rings[ri];
+                int n = ring.Items.Count;
+                if (n <= 0) return null;
+                idx += dir;
+                if (idx >= n)
+                {
+                    if (ri + 1 < rings.Count) { ri++; ring = rings[ri]; idx = 0; }
+                    else idx = 0;
+                }
+                if (idx < 0)
+                {
+                    if (ri > 0) { ri--; ring = rings[ri]; n = ring.Items.Count; idx = Math.Max(0, n - 1); }
+                    else idx = Math.Max(0, n - 1);
+                }
+                if (ring.Items.Count == 0) return null;
+                if (idx >= ring.Items.Count) idx = ring.Items.Count - 1;
+                return ring.Items[idx];
+            }
+            catch (Exception ex) { Log.W("kb next failed: " + ex.Message); return null; }
+        }
+
+        public AppEntry KbRing(int delta)
+        {
+            try
+            {
+                if (rings == null || rings.Count == 0) return null;
+                int ri = -1, idx = 0;
+                for (int i = 0; i < rings.Count && ri < 0; i++)
+                {
+                    int j = hovered == null ? -1 : rings[i].Items.IndexOf(hovered);
+                    if (j >= 0) { ri = i; idx = j; }
+                }
+                if (ri < 0) { ri = 0; idx = 0; }
+                int target = ri + delta;
+                if (target < 0 || target >= rings.Count) return null;
+                var ring = rings[target];
+                if (ring.Items.Count == 0) return null;
+                int k = Math.Min(idx, ring.Items.Count - 1);
+                if (k < 0) k = 0;
+                return ring.Items[k];
+            }
+            catch (Exception ex) { Log.W("kb ring failed: " + ex.Message); return null; }
+        }
         public AppEntry Commit()
         {
             var h = hovered;
@@ -6886,6 +7170,7 @@ var cornerPatch = new System.Windows.Shapes.Rectangle
         QuickSearchWindow searchWin;
         bool dbgEsq, dbgSearch; string dbgEsqText = "", dbgSearchText = "";
         bool noHotkeys;
+        bool ForceGrid;   // --grid: force grid panel (test hook)
         int lastHotkeyTick;
         public static Action<int> HotkeyFire;
         public static System.Windows.Threading.Dispatcher UiDispatcher;
@@ -6903,6 +7188,7 @@ var cornerPatch = new System.Windows.Shapes.Rectangle
         {
             base.OnStartup(e);
             MouseHook.AcceptInjected = e.Args.Contains("--accept-injected");
+            ForceGrid = e.Args.Contains("--grid");
             AiStore.Migrate();   // 老版本明文 Key 自动转 DPAPI 加密
 
             // 调试口：--gametest=<pid> 直接判定某进程是不是游戏（不看前台），用于验证商店/加速器排除规则
@@ -7080,7 +7366,13 @@ var cornerPatch = new System.Windows.Shapes.Rectangle
             hook.Move += OnMove;
             var tick = new System.Windows.Threading.DispatcherTimer(System.Windows.Threading.DispatcherPriority.Input);
             tick.Interval = TimeSpan.FromMilliseconds(25);
-            tick.Tick += delegate { Native.POINT cp; Native.GetCursorPos(out cp); OnMove(cp.x, cp.y); };
+        tick.Tick += delegate
+        {
+            Native.POINT cp; Native.GetCursorPos(out cp);
+            if (kbNav && wheel != null && !pressed && Math.Abs(cp.x - kbMx) + Math.Abs(cp.y - kbMy) <= 14) return;  // 键盘导航中，别让静止的光标把选中项拉走
+            if (kbNav) kbNav = false;
+            OnMove(cp.x, cp.y);
+        };
             tick.Start();
             var wd = new System.Windows.Threading.DispatcherTimer(System.Windows.Threading.DispatcherPriority.Background);
             wd.Interval = TimeSpan.FromMilliseconds(300);
@@ -7248,6 +7540,7 @@ var cornerPatch = new System.Windows.Shapes.Rectangle
             if (e.Args.Contains("--wheelsettings")) { startGameTab = e.Args.Contains("--gametab"); startLookTab = e.Args.Contains("--looktab"); startAiTab = e.Args.Contains("--aitab"); Dispatcher.BeginInvoke(new Action(() => OpenWheelSettings())); }
             if (e.Args.Contains("--autofolders")) { Dispatcher.BeginInvoke(new Action(delegate { var w = new AutoFoldersWindow(); w.ShowDialog(); })); }
             if (e.Args.Contains("--shot")) WheelWindow.ShotMode = true;
+            if (e.Args.Contains("--dumpxy")) WheelWindow.DumpXy = true;
             if (e.Args.Contains("--show1")) { Dispatcher.BeginInvoke(new Action(() => { var w = WF.Screen.PrimaryScreen.WorkingArea; ShowWheel(1, w.Width / 2, w.Height / 2, w.Width / 2 - 200, w.Height / 2);
             if (e.Args.Contains("--clicktest")) DispatcherTimerOneShot(900, delegate { Log.W("clicktest fire"); if (MouseHook.LeftClick != null) MouseHook.LeftClick(w.Width / 2, w.Height / 2); });
             if (e.Args.Contains("--clickicon")) DispatcherTimerOneShot(1100, delegate {
@@ -7269,7 +7562,9 @@ var cornerPatch = new System.Windows.Shapes.Rectangle
                 hp.WindowStyle = unchecked((int)0x80000000);
                 hp.ExtendedWindowStyle = 0x00000080 | 0x08000000;
                 MouseHook.HotkeyFire = QuickWheel;
+            MouseHook.GoHub = delegate { if (grid != null) { grid.GearSelect(); return; } if (wheel != null) { wheel.HoverHub(); } };
             MouseHook.SearchOpen = delegate(string sq) { OpenSearch(sq); return true; };
+            MouseHook.DiscSwitch = SwitchDisc;
                 MouseHook.UiDispatcher = Dispatcher;
                 hkSrc = new System.Windows.Interop.HwndSource(hp);
                 hkSrc.AddHook(HotkeyHook);
@@ -7743,10 +8038,24 @@ var cornerPatch = new System.Windows.Shapes.Rectangle
             return IntPtr.Zero;
         }
 
+        void SwitchDisc(int which)
+        {
+            try
+            {
+                if (Settings.WheelStyle == 1) { Log.W("disc switch skipped (grid mode)"); return; }
+                Native.POINT cp; Native.GetCursorPos(out cp);
+                CloseWheel();
+                ShowWheel(which, cp.x, cp.y, cp.x, cp.y);
+                Log.W("disc switch " + which);
+            }
+            catch (Exception ex) { Log.W("disc switch failed: " + ex.Message); }
+        }
         void OpenSearch(string seed)
         {
             try
             {
+                // 从轮盘打字跳过来时，先把轮盘收掉，免得两个窗口叠着抢键盘
+                if (wheel != null) { CloseWheel(); Log.W("search opens -> wheel closed"); }
                 if (searchWin != null)
                 {
                     searchWin.Seed(seed);
@@ -7991,7 +8300,8 @@ var cornerPatch = new System.Windows.Shapes.Rectangle
 
         void ShowWheel(int btn, int sx, int sy, int curX, int curY)
         {
-            if (Settings.WheelStyle == 1) { ShowGrid(btn, sx, sy); return; }
+            kbNav = false;
+            if (Settings.WheelStyle == 1 || ForceGrid) { ShowGrid(btn, sx, sy); return; }
             try
             {
                 scale = GetScaleAt(sx, sy);
@@ -8125,6 +8435,7 @@ static int Cap(double radius, double icon)
         }
 
         AppEntry kbSel; int kbCurX, kbCurY; DateTime kbAt; bool kbGearHold;
+        bool kbNav; int kbMx, kbMy;   // 键盘导航期间冻结"跟随鼠标"，否则每 25ms 被光标拉回去
         List<List<Ring>> wPages; int wPage, wBtn; double wIcon, wHub, wR0; string wTag;
         int kbLastDx, kbLastDy, kbLastTick;
         double stickX, stickY; bool stickOn; int stickCurX, stickCurY;
@@ -8178,52 +8489,19 @@ static int Cap(double radius, double icon)
                 return;
             }
             if (wheel == null) return;
-            double len = Math.Sqrt((double)dx * dx + (double)dy * dy);
-            if (len < 0.5) return;
-            if (dx == kbLastDx && dy == kbLastDy && Environment.TickCount - kbLastTick < 150) return;
-            kbLastDx = dx; kbLastDy = dy; kbLastTick = Environment.TickCount;
-            double vx = dx / len, vy = dy / len;
+            if (dx == 0 && dy == 0) return;   // 摇杆/定时器可能传 0,0，别当作导航
+            kbNav = true; { Native.POINT p0; Native.GetCursorPos(out p0); kbMx = p0.x; kbMy = p0.y; }
+            var target = wheel.KbStep(dx, dy);
+            if (target == null) { Log.W("kb dir none dir=" + dx + "," + dy); return; }
+            var prevSel = kbSel;
+            wheel.HoverItem(target);
+            kbGearHold = false;
+            kbSel = target;
+            if (!ReferenceEquals(target, prevSel)) Log.W("kb dir sel=" + target.Name + " dir=" + dx + "," + dy + " deg=" + (int)wheel.LastPointDeg);
+            lastAct = DateTime.Now;
+            return;
+            return;
 
-            double curX = 0, curY = 0;
-            bool have = kbSel != null && wheel.TryPos(kbSel, out curX, out curY);
-            // 朝圆心方向 → 选中中心「设置」齿轮
-            double rl = Math.Sqrt(curX * curX + curY * curY);
-            if (rl > 1 && have)
-            {
-                double inward = ((-curX) * vx + (-curY) * vy) / rl;
-                if (inward >= 0.45)
-                {
-                    wheel.HoverHub();
-                    kbGearHold = true; kbSel = null;
-                    Native.POINT kh; Native.GetCursorPos(out kh); kbCurX = kh.x; kbCurY = kh.y; kbAt = DateTime.Now;
-                    Log.W("kb nav -> hub");
-                    lastAct = DateTime.Now;
-                    return;
-                }
-            }
-            double bestScore = double.MaxValue; AppEntry best = null;
-            foreach (var it in wheel.AllItems())
-            {
-                if (have && ReferenceEquals(it, kbSel)) continue;
-                double px, py;
-                if (!wheel.TryPos(it, out px, out py)) continue;
-                double ux = px - curX, uy = py - curY;
-                double dist = Math.Sqrt(ux * ux + uy * uy);
-                if (dist < 1) continue;
-                double dot = (ux * vx + uy * vy) / dist;
-                if (dot < 0.72) continue;
-                double score = dist / (dot * dot * dot * dot);
-                if (score < bestScore) { bestScore = score; best = it; }
-            }
-            if (best == null)
-            {
-                Log.W("kb nav none dir=" + dx + "," + dy);
-                return;
-            }
-            Native.POINT kbCur; Native.GetCursorPos(out kbCur); kbCurX = kbCur.x; kbCurY = kbCur.y; kbAt = DateTime.Now;
-            wheel.HoverItem(best);
-            kbSel = best;
-            kbSel = best; kbGearHold = false;
         }
         void KbCommit()
         {
@@ -8244,6 +8522,7 @@ static int Cap(double radius, double icon)
         }
         void CloseWheel()
         {
+            kbNav = false;
             // 任何线程调用都安全：不在 UI 线程就转过去，避免跨线程操作窗口抛异常后留下幽灵窗口
             var d0 = Dispatcher;
             if (d0 != null && !d0.CheckAccess()) { d0.BeginInvoke(new Action(delegate { try { CloseWheel(); } catch { } })); return; }
