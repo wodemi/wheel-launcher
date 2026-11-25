@@ -2053,6 +2053,12 @@ namespace WheelLauncher
             cv.Children.Add(gear);
 
             curX = contentW / 2; curY = contentH / 2;
+            if (WheelWindow.DumpXy)
+            {
+                for (int i = 0; i < tiles.Count; i++)
+                    Log.W("gxy name=" + ((AppEntry)tiles[i].Tag).Name + " x=" + (int)tcx[i] + " y=" + (int)tcy[i]);
+                Log.W("gxy panel w=" + (int)contentW + " h=" + (int)contentH + " gear=" + (int)GearCX + "," + (int)GearCY + " tW=" + (int)tW + " tH=" + (int)tH);
+            }
         }
 
 
@@ -2149,6 +2155,17 @@ namespace WheelLauncher
                 if (d < bd) { bd = d; bi = i; }
             }
             return bi;
+        }
+
+        // 测试钩子：--gpick=<应用名> 直接选中某块瓦片（按名字，不依赖鼠标位置）
+        public void SelectName(string want)
+        {
+            for (int i = 0; i < tiles.Count; i++)
+            {
+                var it = (AppEntry)tiles[i].Tag;
+                if (it != null && it.Name == want) { ApplyHit(i); Log.W("gpick hit " + want + " idx=" + i); return; }
+            }
+            Log.W("gpick miss " + want);
         }
 
         void ApplyHit(int idx)
@@ -2272,6 +2289,16 @@ namespace WheelLauncher
                     }
                     if (horiz || vert)
                     {
+                        if (isGear)
+                        {
+                            // 齿轮不要求"同排/同列"：底行不够长、最右列在下面断了，也要能按到设置。
+                            // 只要它在按键方向前方就参与比较，但带偏离惩罚，所以同一排/同一列里还有
+                            // 瓦片时仍然是瓦片优先；该方向上一个瓦片都没有了，才落到齿轮上。
+                            if (along <= 1) continue;
+                            double sg = along + 2.0 * perp;
+                            if (sg < best) { best = sg; bi = i; }
+                            continue;
+                        }
                         if (perp > band) continue;                 // 不同排/不同列 = 已经到头
                         if (along < best) { best = along; bi = i; }
                         continue;
@@ -7595,7 +7622,8 @@ var cornerPatch = new System.Windows.Shapes.Rectangle
             }); }), DispatcherPriority.Background); }
             var pickArg = e.Args.FirstOrDefault(s => s.StartsWith("--pick="));
             var thenArg = e.Args.FirstOrDefault(s => s.StartsWith("--then="));
-            if (pickArg != null || thenArg != null) DispatcherTimerOneShot(1400, delegate {
+            var gpickArg = e.Args.FirstOrDefault(s => s.StartsWith("--gpick="));
+            if (pickArg != null || thenArg != null || gpickArg != null) DispatcherTimerOneShot(1400, delegate {
                 var ww = wheel;
                 if (pickArg != null && ww != null)
                 {
@@ -7603,6 +7631,13 @@ var cornerPatch = new System.Windows.Shapes.Rectangle
                     bool found = false;
                     foreach (var rg in ww.Rings) { foreach (var it in rg.Items) { if (it.Name == want) { ww.HoverItem(it); kbSel = it; found = true; Log.W("pick hit " + want + " ring=" + rg.Index); break; } } if (found) break; }
                     if (!found) Log.W("pick miss " + want);
+                }
+                if (gpickArg != null)
+                {
+                    // 和圆盘一样：选完必须在同一个回调里立刻走第一下，否则中途重绘会把选中项清掉
+                    var g0 = grid;
+                    if (g0 == null) Log.W("gpick nogrid");
+                    else { g0.SelectName(gpickArg.Substring(8)); kbSel = g0.Hovered; kbGearHold = g0.HubSelected; }
                 }
                 if (thenArg == null) return;
                 string seq = thenArg.Substring(7);
@@ -7635,7 +7670,7 @@ var cornerPatch = new System.Windows.Shapes.Rectangle
                 hp.WindowStyle = unchecked((int)0x80000000);
                 hp.ExtendedWindowStyle = 0x00000080 | 0x08000000;
                 MouseHook.HotkeyFire = QuickWheel;
-            MouseHook.GoHub = delegate { if (grid != null) { grid.GearSelect(); return; } if (wheel != null) { wheel.HoverHub(); } };
+            MouseHook.GoHub = GoGear;
             MouseHook.SearchOpen = delegate(string sq) { OpenSearch(sq); return true; };
             MouseHook.DiscSwitch = SwitchDisc;
                 MouseHook.UiDispatcher = Dispatcher;
@@ -8551,6 +8586,30 @@ static int Cap(double radius, double icon)
             wheel.UpdateHover(sx, sy, wheel.WinScale);
             lastAct = DateTime.Now;
         }
+        // H 键：直接把「设置」当目标选中。必须同时把键盘持有状态记下来（kbCurX/kbCurY/kbAt/kbGearHold），
+        // 否则面板跟着鼠标，OnMove 下一帧就用鼠标位置重算 hover，把刚选中的齿轮清掉 →
+        // 表面上"H 没反应"，接着按 Enter 会去启动鼠标下那块瓦片。
+        void GoGear()
+        {
+            Native.POINT gp; Native.GetCursorPos(out gp);
+            if (grid != null)
+            {
+                grid.GearSelect();
+                kbSel = null; kbGearHold = grid.HubSelected; stickOn = false;
+                kbCurX = gp.x; kbCurY = gp.y; kbAt = DateTime.Now;
+                Log.W("grid dir gear via H");
+                lastAct = DateTime.Now;
+                return;
+            }
+            if (wheel == null) return;
+            wheel.HoverHub();
+            kbSel = null; kbGearHold = wheel.HubSelected; stickOn = false;
+            kbNav = true; kbMx = gp.x; kbMy = gp.y;
+            kbCurX = gp.x; kbCurY = gp.y; kbAt = DateTime.Now;
+            Log.W("kb dir hub via H");
+            lastAct = DateTime.Now;
+        }
+
         void KbMove(int dx, int dy)
         {
             if (grid != null)
